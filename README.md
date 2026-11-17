@@ -34,7 +34,10 @@ to fix things on first run; the info panel in the app prints what the phone repo
    (or column, for cameras stacked along the image's y axis) at the narrower lens's
    focal length.
 4. **Re-align from image content.** Factory calibration is rarely good to a pixel, so
-   ORB feature matches are used to fit and remove the leftover row misalignment.
+   ORB feature matches are used to fit and remove the leftover row misalignment, and to
+   detect a camera order that is reported the wrong way round. If the calibration is
+   too far off for that, a coarse fit of scale, rotation and offset is applied first;
+   depth is then labelled relative. The app retries until an alignment succeeds.
 5. **Match.** OpenCV semi-global block matching gives disparity `d`; depth is
    `focal_px * baseline / d`.
 
@@ -64,7 +67,9 @@ Needs Android 9+ and a phone that exposes its physical cameras to third-party ap
 app says so and lists what the phone does expose.
 
 In the app: pick a pair, point at something textured 0.2 to 1.5 m away. **Re-align**
-redoes step 4 for the current scene. **Record** writes a session; **Share last** zips it.
+redoes step 4 for the current scene. Tap the left image to switch between the
+reference camera, the second camera and a red/cyan overlay of both; in a good
+alignment the overlay is grey with colour fringes only along the baseline. **Record** writes a session; **Share last** zips it.
 
 ## Process a recording
 

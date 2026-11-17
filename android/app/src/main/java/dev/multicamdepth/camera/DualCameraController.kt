@@ -24,6 +24,8 @@ class DualCameraController(
     private val pair: CameraPair,
     private val width: Int,
     private val height: Int,
+    /** true: ask the phone for uncorrected images (the app then undistorts them itself) */
+    private val disableDistortionCorrection: Boolean,
     private val onPair: (ref: Frame, aux: Frame) -> Unit,
     private val onError: (String) -> Unit,
 ) {
@@ -87,7 +89,7 @@ class DualCameraController(
                         // anything that moves the lens or warps the image breaks the calibration
                         set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
                         set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-                        if (pair.canDisableDistortionCorrection) {
+                        if (disableDistortionCorrection && pair.canDisableDistortionCorrection) {
                             set(CaptureRequest.DISTORTION_CORRECTION_MODE, CameraMetadata.DISTORTION_CORRECTION_MODE_OFF)
                         }
                     }

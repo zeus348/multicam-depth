@@ -79,3 +79,46 @@ def test_relative_pose_from_android_quaternions():
 def test_scale_intrinsics_crops_to_aspect():
     fx, fy, cx, cy = geometry.scale_intrinsics(3000, 3000, 2000, 1500, 4000, 3000, 1280, 720)
     assert fx == pytest.approx(960) and cx == pytest.approx(640) and cy == pytest.approx(360)
+
+
+def _depth_ok(sd, ref, aux, truth):
+    import cv2
+
+    _, _, _, depth = sd.compute(ref, aux)
+    truth_rect = cv2.remap(truth.astype(np.float32), *sd.map_ref, cv2.INTER_NEAREST)
+    return depth, truth_rect
+
+
+def test_refine_detects_reversed_baseline():
+    true_rig = synth.phone_rig()
+    ref, aux, truth = synth.render_pair(true_rig)
+    wrong = StereoRig(true_rig.ref, true_rig.aux, true_rig.r, -true_rig.t)  # phone reports the mirror layout
+    sd = StereoDepth(wrong, out_size=(640, 480))
+    info = sd.refine(ref, aux)
+    assert info["applied"] and info["baseline_flipped"] and not sd.self_calibrated
+    depth, truth_rect = _depth_ok(sd, ref, aux, truth)
+    assert region_error(depth, truth_rect, 0.4, 0.6) < 0.08
+
+
+def test_refine_survives_grossly_wrong_calibration():
+    import cv2
+    from mcdepth.pipeline import Camera
+
+    true_rig = synth.phone_rig()
+    ref, aux, truth = synth.render_pair(true_rig)
+    k = true_rig.aux.k.copy()
+    k[0, 0] *= 1.12  # focal length 12 % off
+    k[1, 1] *= 1.12
+    k[0, 2] += 25  # principal point 25 px off
+    k[1, 2] -= 18
+    err, _ = cv2.Rodrigues(np.deg2rad([0.0, 0.0, 3.0]))  # and rotated 3 degrees
+    bad = StereoRig(true_rig.ref, Camera(1280, 960, k), err @ true_rig.r, err @ true_rig.t)
+    sd = StereoDepth(bad, out_size=(640, 480))
+    _, _, _, before = sd.compute(ref, aux)
+    info = sd.refine(ref, aux)
+    assert info["applied"] and info.get("coarse") and sd.self_calibrated
+    depth, truth_rect = _depth_ok(sd, ref, aux, truth)
+    assert np.isfinite(depth).mean() > max(0.5, np.isfinite(before).mean() + 0.2)
+    near = np.nanmedian(depth[(truth_rect > 0.4) & (truth_rect < 0.6)])
+    far = np.nanmedian(depth[(truth_rect > 1.3) & (truth_rect < 1.7)])
+    assert near < far  # relative depth: ordering is right even though scale is not

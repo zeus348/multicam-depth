@@ -38,6 +38,8 @@ class StereoDepth:
             rig.ref.k[0, 0], rig.ref.width, rig.aux.k[0, 0], rig.aux.width, self.out_w, self.out_h
         )
         self.correction = np.eye(3)
+        self.baseline_sign = 1.0  # -1 if the images show the reported camera order is reversed
+        self.self_calibrated = False  # True if depth is only relative after a coarse fit
         along = self.out_h if self.rect.vertical else self.out_w
         nd = max_disparity or along // 5
         self.num_disparities = max(16, int(np.ceil(nd / 16)) * 16)
@@ -59,30 +61,101 @@ class StereoDepth:
 
     # ---- refinement from image content ----------------------------------
     def refine(self, img_ref, img_aux) -> dict:
-        """Estimate the residual row misalignment from feature matches and fold
-        it into the aux rectification map.  Always starts from the nominal
-        calibration, so calling it repeatedly does not accumulate error."""
+        """Align the rectified pair using feature matches.
+
+        1. Fine: fit the leftover row misalignment, assuming the calibration is
+           nearly right. Also detects a baseline that points the wrong way.
+        2. Coarse (only if 1 fails): the calibration is badly off, so first fit
+           scale, rotation and offset between the images, then run 1 again.
+           Depth is then no longer metric (self.self_calibrated is set).
+
+        Always starts from the nominal calibration, so repeated calls do not
+        accumulate error."""
         self.correction = np.eye(3)
+        self.baseline_sign = 1.0
+        self.self_calibrated = False
         self._build_maps()
-        rect_ref, rect_aux = self.rectify(_gray(img_ref), _gray(img_aux))
+        gray_ref, gray_aux = _gray(img_ref), _gray(img_aux)
+        info = self._fine(gray_ref, gray_aux)
+        if not info["applied"]:
+            coarse = self._coarse(info.pop("_p1"), info.pop("_p2"))
+            if coarse is not None:
+                self.correction = coarse
+                self._build_maps()
+                second = self._fine(gray_ref, gray_aux)
+                if second["applied"]:
+                    self.self_calibrated = True
+                    info = second
+                    info["coarse"] = True
+                else:
+                    self.correction = np.eye(3)
+                    self._build_maps()
+        info.pop("_p1", None)
+        info.pop("_p2", None)
+        return info
+
+    def _usable(self, p1, p2, sign):
+        """Matches that could be a stereo correspondence for a baseline pointing along `sign`."""
+        ax, other = self.rect.axis, 1 - self.rect.axis
+        d = (p1[:, ax] - p2[:, ax]) * sign
+        lim = 0.05 * (self.out_w if self.rect.vertical else self.out_h)
+        return (np.abs(p1[:, other] - p2[:, other]) < lim) & (d > -lim) & (d < self.num_disparities + lim)
+
+    def _fine(self, gray_ref, gray_aux) -> dict:
+        rect_ref, rect_aux = self.rectify(gray_ref, gray_aux)
         p1, p2 = match_features(rect_ref, rect_aux)
-        ax = self.rect.axis
-        other = 1 - ax
-        info = {"matches": len(p1), "inliers": 0, "applied": False}
-        if len(p1):
-            # keep only matches that could be a valid stereo correspondence
-            d = (p1[:, ax] - p2[:, ax]) * np.sign(self.rect.baseline)
-            lim = 0.05 * (self.out_w if self.rect.vertical else self.out_h)
-            ok = (np.abs(p1[:, other] - p2[:, other]) < lim) & (d > -lim) & (d < self.num_disparities + lim)
-            p1, p2 = p1[ok], p2[ok]
-            info["before_px"] = float(np.median(np.abs(p1[:, other] - p2[:, other]))) if len(p1) else None
-        h, inliers = geometry.fit_row_alignment(p1, p2, self.rect.vertical, (self.out_w / 2.0, self.out_h / 2.0))
+        info = {"matches": len(p1), "usable": 0, "inliers": 0, "applied": False, "_p1": p1, "_p2": p2}
+        if not len(p1):
+            return info
+        nominal = np.sign(self.rect.baseline)
+        sign = 1.0
+        # Nearly all true disparities have the same sign. If that sign is the opposite of
+        # what the calibration says, the reported camera order is the wrong way round.
+        ax, other = self.rect.axis, 1 - self.rect.axis
+        lim = 0.05 * (self.out_w if self.rect.vertical else self.out_h)
+        d = (p1[:, ax] - p2[:, ax]) * nominal
+        rows = (np.abs(p1[:, other] - p2[:, other]) < lim) & (np.abs(d) < self.num_disparities + lim)
+        if rows.sum() >= 30 and np.median(d[rows]) < -2.0:
+            sign = -1.0
+        ok = self._usable(p1, p2, nominal * sign)
+        info["usable"] = int(ok.sum())
+        h, inliers = geometry.fit_row_alignment(p1[ok], p2[ok], self.rect.vertical, (self.out_w / 2.0, self.out_h / 2.0))
         info["inliers"] = inliers
         if h is not None:
-            self.correction = h
+            self.correction = h @ self.correction
+            self.baseline_sign = sign
             self._build_maps()
             info["applied"] = True
+            info["baseline_flipped"] = sign < 0
         return info
+
+    def _coarse(self, p1, p2):
+        """Similarity transform taking aux points onto ref points, with the offset along
+        the baseline chosen so that every disparity stays positive. None if unreliable."""
+        if len(p1) < 20:
+            return None
+        m, inl = cv2.estimateAffinePartial2D(
+            p2.astype(np.float32), p1.astype(np.float32), method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+        if m is None or inl.sum() < 15:
+            return None
+        scale = float(np.hypot(m[0, 0], m[1, 0]))
+        angle = float(np.degrees(np.arctan2(m[1, 0], m[0, 0])))
+        if not 0.5 < scale < 2.0 or abs(angle) > 15:
+            return None
+        h = np.vstack([m, [0, 0, 1.0]])
+        # the fit put the dominant surface at zero disparity; anything farther would be
+        # negative. Shift so the farthest matched points sit just above zero.
+        ax, other = self.rect.axis, 1 - self.rect.axis
+        moved = p2 @ m[:, :2].T + m[:, 2]
+        near_row = np.abs(moved[:, other] - p1[:, other]) < 3.0
+        d = (p1[near_row, ax] - moved[near_row, ax]) * np.sign(self.rect.baseline)
+        d = d[np.abs(d) < self.num_disparities]
+        if len(d) < 15:
+            return None
+        shift = 2.0 - np.percentile(d, 2)
+        h[ax, 2] -= shift * np.sign(self.rect.baseline)
+        return h
 
     # ---- matching --------------------------------------------------------
     def disparity(self, rect_ref, rect_aux) -> np.ndarray:
@@ -91,7 +164,7 @@ class StereoDepth:
         left, right = _gray(rect_ref), _gray(rect_aux)
         if self.rect.vertical:
             left, right = cv2.transpose(left), cv2.transpose(right)
-        flipped = self.rect.baseline < 0  # reference camera is the right-hand one
+        flipped = self.rect.baseline * self.baseline_sign < 0  # reference camera is the right-hand one
         if flipped:
             left, right = cv2.flip(left, 1), cv2.flip(right, 1)
         block = 5

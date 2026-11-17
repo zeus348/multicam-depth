@@ -26,6 +26,7 @@ import dev.multicamdepth.camera.CameraPair
 import dev.multicamdepth.camera.DualCameraController
 import dev.multicamdepth.camera.Frame
 import dev.multicamdepth.depth.DepthEngine
+import dev.multicamdepth.depth.View as DepthView
 import dev.multicamdepth.record.SessionRecorder
 import org.opencv.android.OpenCVLoader
 import java.io.File
@@ -36,6 +37,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class MainActivity : Activity() {
+    private companion object {
+        const val ALIGN_RETRY_FRAMES = 10
+    }
+
     private lateinit var cameraManager: CameraManager
     private lateinit var status: TextView
     private lateinit var info: TextView
@@ -43,6 +48,9 @@ class MainActivity : Activity() {
     private lateinit var depthView: ImageView
     private lateinit var recordButton: Button
     private lateinit var baselineButton: Button
+    private lateinit var distortionButton: Button
+    private var appUndistorts = true
+    @Volatile private var viewMode = DepthView.REFERENCE
 
     private val depthThread = HandlerThread("depth").apply { start() }
     private val depthHandler = Handler(depthThread.looper)
@@ -57,6 +65,7 @@ class MainActivity : Activity() {
     // touched only on the depth thread
     private var engine: DepthEngine? = null
     private var alignNote = ""
+    private var frameCount = 0
 
     @Volatile private var alignRequested = true
     @Volatile private var recorder: SessionRecorder? = null
@@ -77,6 +86,12 @@ class MainActivity : Activity() {
         recordButton.setOnClickListener { toggleRecording() }
         findViewById<Button>(R.id.alignButton).setOnClickListener { alignRequested = true }
         findViewById<Button>(R.id.shareButton).setOnClickListener { shareLast() }
+        distortionButton = findViewById(R.id.distortionButton)
+        distortionButton.setOnClickListener {
+            appUndistorts = !appUndistorts
+            restartCamera()
+        }
+        refView.setOnClickListener { viewMode = viewMode.next() }
         baselineButton.setOnClickListener {
             assumed = assumed.next()
             restartCamera()
@@ -149,7 +164,11 @@ class MainActivity : Activity() {
         val p = pair ?: return
         if (controller != null) return
         val (w, h) = p.commonSize() ?: return
-        val distorted = p.canDisableDistortionCorrection || !p.hasDistortionCorrection
+        // Who removes lens distortion: the app (from published coefficients) or the phone.
+        // Phones differ in which of the two actually works, so it can be switched.
+        val distorted = if (p.canDisableDistortionCorrection && p.hasDistortionCorrection) appUndistorts else !p.hasDistortionCorrection
+        distortionButton.visibility = if (p.canDisableDistortionCorrection && p.hasDistortionCorrection) View.VISIBLE else View.GONE
+        distortionButton.text = "Lens distortion removed by: ${if (appUndistorts) "app" else "phone"}. Tap to switch"
         val newRig = CalibrationBuilder.build(p.ref, p.aux, w, h, distorted, assumed)
         rig = newRig
         baselineButton.visibility = if (newRig.metric) View.GONE else View.VISIBLE
@@ -172,6 +191,7 @@ class MainActivity : Activity() {
                 append("stream ${w}x$h, depth ${w / scale}x${h / scale}\n")
                 append("sync=${p.syncType} (1 = hardware synced)  clock=${p.timestampSource} (1 = same as IMU)\n")
                 append(newRig.source.replace("; ", "\n")).append('\n')
+                append(describe(newRig, p))
                 if (e != null) {
                     append("baseline %.1f mm %s, focal %.0f px\n".format(
                         abs(e.rect.baseline) * 1000, if (e.rect.vertical) "vertical" else "horizontal", e.focal))
@@ -181,9 +201,24 @@ class MainActivity : Activity() {
             }
             runOnUiThread { info.text = text }
         }
-        controller = DualCameraController(cameraManager, p, w, h, ::onPair) { msg ->
+        controller = DualCameraController(cameraManager, p, w, h, distorted, ::onPair) { msg ->
             runOnUiThread { status.text = msg }
         }.also { it.open() }
+    }
+
+    /** Raw numbers behind the calibration, for diagnosing a phone whose depth looks wrong. */
+    private fun describe(rig: StereoRig, p: CameraPair) = buildString {
+        for ((cam, model) in listOf(p.ref to rig.ref, p.aux to rig.aux)) {
+            append("cam ${cam.id}: array ${cam.arrayWidth}x${cam.arrayHeight}, sensor %.2fx%.2f mm\n".format(cam.sensorWidthMm, cam.sensorHeightMm))
+            append("  published K: ${cam.intrinsics?.joinToString { "%.1f".format(it) } ?: "none"}\n")
+            append("  stream K: %.1f %.1f %.1f %.1f\n".format(model.k.fx, model.k.fy, model.k.cx, model.k.cy))
+            append("  published dist: ${cam.distortion?.joinToString { "%.4f".format(it) } ?: "none"}\n")
+            append("  pose t (mm): ${cam.poseTranslation?.joinToString { "%.2f".format(it * 1000) } ?: "none"}\n")
+            append("  pose q: ${cam.poseRotation?.joinToString { "%.4f".format(it) } ?: "none"}\n")
+        }
+        val angle = Math.toDegrees(kotlin.math.acos(((rig.r[0] + rig.r[4] + rig.r[8] - 1) / 2).coerceIn(-1.0, 1.0)))
+        append("relative: T (mm) ${rig.t.joinToString { "%.2f".format(it * 1000) }}, rotation %.2f deg\n".format(angle))
+        append("distortion modes: off=${p.canDisableDistortionCorrection} on=${p.hasDistortionCorrection}\n")
     }
 
     private fun stopCamera() {
@@ -199,16 +234,20 @@ class MainActivity : Activity() {
         depthHandler.post {
             try {
                 val e = engine ?: return@post
-                if (alignRequested) {
+                // the first frames after opening are often dark or blurred, so keep trying
+                // until an alignment succeeds
+                frameCount++
+                if (alignRequested || (!e.aligned && frameCount % ALIGN_RETRY_FRAMES == 0)) {
                     alignRequested = false
                     alignNote = e.refine(ref, aux)
                 }
-                val r = e.compute(ref, aux)
-                val unit = if (rig?.metric == true) "m" else "(relative)"
+                val mode = viewMode
+                val r = e.compute(ref, aux, mode)
+                val unit = if (rig?.metric == true && !e.selfCalibrated) "m" else "(relative)"
                 val center = if (r.centerDepth.isNaN()) "no reading" else "%.2f %s".format(r.centerDepth, unit)
                 val rec = recorder?.let { "  REC ${it.written.get()} pairs, ${it.skipped.get()} skipped" } ?: ""
                 val line = "centre: $center   ${(r.validFraction * 100).toInt()}% valid   ${r.millis} ms\n" +
-                    "$alignNote   skew ${(ref.timestampNs - aux.timestampNs) / 1000} us$rec"
+                    "left: ${mode.label} (tap image to switch)\n$alignNote\nskew ${(ref.timestampNs - aux.timestampNs) / 1000} us$rec"
                 runOnUiThread {
                     refView.setImageBitmap(r.reference)
                     depthView.setImageBitmap(r.depth)
