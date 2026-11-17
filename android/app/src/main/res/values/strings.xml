@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Multicam Depth</string>
+    <string name="record">Record</string>
+    <string name="stop">Stop</string>
+    <string name="realign">Re-align</string>
+    <string name="share">Share last</string>
+    <string name="reference_view">Reference camera, rectified</string>
+    <string name="depth_view">Depth map</string>
+</resources>
