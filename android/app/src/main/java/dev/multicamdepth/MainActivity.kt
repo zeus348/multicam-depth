@@ -18,7 +18,6 @@ import android.widget.ImageView
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.content.FileProvider
-import dev.multicamdepth.calib.AssumedBaseline
 import dev.multicamdepth.calib.CalibrationBuilder
 import dev.multicamdepth.calib.StereoRig
 import dev.multicamdepth.camera.CameraCatalog
@@ -58,7 +57,7 @@ class MainActivity : Activity() {
 
     private var pairs: List<CameraPair> = emptyList()
     private var pair: CameraPair? = null
-    private var assumed = AssumedBaseline.PLUS_X
+    private var flipSides = false
     private var controller: DualCameraController? = null
     private var rig: StereoRig? = null
 
@@ -93,7 +92,7 @@ class MainActivity : Activity() {
         }
         refView.setOnClickListener { viewMode = viewMode.next() }
         baselineButton.setOnClickListener {
-            assumed = assumed.next()
+            flipSides = !flipSides
             restartCamera()
         }
 
@@ -169,10 +168,13 @@ class MainActivity : Activity() {
         val distorted = if (p.canDisableDistortionCorrection && p.hasDistortionCorrection) appUndistorts else !p.hasDistortionCorrection
         distortionButton.visibility = if (p.canDisableDistortionCorrection && p.hasDistortionCorrection) View.VISIBLE else View.GONE
         distortionButton.text = "Lens distortion removed by: ${if (appUndistorts) "app" else "phone"}. Tap to switch"
-        val newRig = CalibrationBuilder.build(p.ref, p.aux, w, h, distorted, assumed)
+        val newRig = CalibrationBuilder.build(
+            p.ref, p.aux, w, h, distorted, p.sensorOrientation,
+            p.facing == android.hardware.camera2.CameraMetadata.LENS_FACING_FRONT, flipSides,
+        )
         rig = newRig
-        baselineButton.visibility = if (newRig.metric) View.GONE else View.VISIBLE
-        baselineButton.text = "Camera layout unknown, assuming $assumed. Tap to try the next one"
+        baselineButton.visibility = View.VISIBLE
+        baselineButton.text = "Near and far look swapped? Tap to flip" + if (flipSides) " (flipped)" else ""
 
         // live depth runs at reduced resolution; recordings keep the full frames
         val scale = if (w > 800) 2 else 1

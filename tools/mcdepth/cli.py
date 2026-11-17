@@ -32,9 +32,11 @@ def process(args):
     if not args.no_refine:
         info = sd.refine(*load(frames[len(frames) // 2]))
         print("refine:", info)
+    relative = sd.self_calibrated or not rig.metric
     print(
         f"baseline {abs(sd.rect.baseline) * 1000:.1f} mm ({'vertical' if sd.rect.vertical else 'horizontal'}), "
-        f"focal {sd.k_new[0, 0]:.0f} px, depth is {'metric' if rig.metric else 'RELATIVE (assumed baseline)'}"
+        f"focal {sd.k_new[0, 0]:.0f} px, depth is "
+        + ("RELATIVE (geometry measured from the images, or baseline assumed)" if relative else "metric")
     )
     for row in frames:
         ref, aux = load(row)

@@ -1,6 +1,6 @@
 package dev.multicamdepth.calib
 
-import kotlin.math.abs
+import kotlin.math.sqrt
 
 /** What one physical camera reports about itself, as plain data (see CameraCatalog). */
 class PhysicalCamera(
@@ -26,19 +26,17 @@ class PhysicalCamera(
     val fovRatio get() = sensorWidthMm / focalMm
 }
 
-/** Used when the phone publishes no camera positions. Axis is in sensor image coordinates. */
-enum class AssumedBaseline(val x: Double, val y: Double) {
-    PLUS_X(1.0, 0.0), MINUS_X(-1.0, 0.0), PLUS_Y(0.0, 1.0), MINUS_Y(0.0, -1.0);
-
-    fun next() = entries[(ordinal + 1) % entries.size]
-}
-
 object CalibrationBuilder {
     const val ASSUMED_BASELINE_M = 0.012
+
+    /** Lens modules are several millimetres wide, so a smaller reported spacing is a placeholder. */
+    private const val MIN_PLAUSIBLE_BASELINE_M = 0.004
 
     /**
      * @param distorted true if the delivered images still contain lens distortion
      *        (distortion correction off or unsupported), so coefficients must be applied.
+     * @param flip swap which side the second camera is on; the user's override for phones
+     *        that report it wrongly (near and far would otherwise come out swapped).
      */
     fun build(
         ref: PhysicalCamera,
@@ -46,29 +44,61 @@ object CalibrationBuilder {
         width: Int,
         height: Int,
         distorted: Boolean,
-        assumed: AssumedBaseline,
+        sensorOrientation: Int,
+        frontFacing: Boolean,
+        flip: Boolean = false,
     ): StereoRig {
         val notes = ArrayList<String>()
         val refModel = model(ref, width, height, distorted, notes)
         val auxModel = model(aux, width, height, distorted, notes)
 
         var r = Mat3.identity
-        var t = doubleArrayOf(-assumed.x * ASSUMED_BASELINE_M, -assumed.y * ASSUMED_BASELINE_M, 0.0)
+        var t = doubleArrayOf(-ASSUMED_BASELINE_M, 0.0, 0.0)
         var metric = false
         if (hasPose(ref) && hasPose(aux)) {
-            val (pr, pt) = StereoGeometry.relativePose(
-                ref.poseRotation!!, ref.poseTranslation!!, aux.poseRotation!!, aux.poseTranslation!!,
-            )
-            if (pt.any { abs(it) > 1e-4 }) {
-                r = pr
-                t = pt
-                metric = true
+            val r1 = StereoGeometry.quatToRot(ref.poseRotation!!)
+            val r2 = StereoGeometry.quatToRot(aux.poseRotation!!)
+            val expected = StereoGeometry.orientationRotation(sensorOrientation, frontFacing)
+            val d = DoubleArray(3) { (ref.poseTranslation!![it] - aux.poseTranslation!![it]).toDouble() }
+            if (StereoGeometry.angleBetween(r1, r2) < 0.01 && StereoGeometry.angleBetween(r1, expected) > 20) {
+                // Both lenses report the same rotation, and it disagrees with how the images are
+                // oriented: a placeholder. Positions are still given in device axes, so map
+                // them into the image using the sensor orientation instead.
+                t = Mat3.mulVec(expected, d)
+                notes += "pose rotation: placeholder, using sensor orientation"
+            } else {
+                r = Mat3.mul(r2, Mat3.transpose(r1))
+                t = Mat3.mulVec(r2, d)
+                notes += "pose rotation: published"
             }
+            val length = sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2])
+            when {
+                length >= MIN_PLAUSIBLE_BASELINE_M -> {
+                    metric = true
+                    notes += "baseline: published"
+                }
+                length > 1e-5 -> {
+                    // keep the direction, which is all a placeholder can still tell us
+                    t = DoubleArray(3) { t[it] / length * ASSUMED_BASELINE_M }
+                    notes += "baseline: published %.1f mm is implausible, assuming %.0f mm".format(
+                        length * 1000, ASSUMED_BASELINE_M * 1000,
+                    )
+                }
+                else -> {
+                    r = Mat3.identity
+                    t = doubleArrayOf(-ASSUMED_BASELINE_M, 0.0, 0.0)
+                    notes += "baseline: none published, assumed"
+                }
+            }
+        } else {
+            notes += "pose: none published, assumed"
         }
-        notes += if (metric) "pose: published by device" else "pose: ASSUMED ($assumed, ${ASSUMED_BASELINE_M * 1000} mm)"
+        if (flip) {
+            t = DoubleArray(3) { -t[it] }
+            notes += "camera sides swapped by user"
+        }
         return StereoRig(refModel, auxModel, r, t, metric, notes.joinToString("; "))
     }
-
     private fun hasPose(c: PhysicalCamera) = c.poseRotation?.size == 4 && c.poseTranslation?.size == 3
 
     private fun model(c: PhysicalCamera, w: Int, h: Int, distorted: Boolean, notes: MutableList<String>): CameraModel {

@@ -2,6 +2,12 @@ package dev.multicamdepth.calib
 
 import java.util.Random
 import kotlin.math.abs
+import kotlin.math.acos
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.sin
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -218,6 +224,165 @@ object StereoGeometry {
     }
 
     private const val MIN_INLIERS = 12
+
+    /**
+     * Device ("sensor") coordinates -> camera coordinates, derived from SENSOR_ORIENTATION alone.
+     * Used when a phone publishes a placeholder LENS_POSE_ROTATION that does not match how its
+     * images are oriented. Device axes: x right, y up, z out of the screen.
+     */
+    fun orientationRotation(sensorOrientation: Int, frontFacing: Boolean): DoubleArray {
+        val a = Math.toRadians(sensorOrientation.toDouble())
+        val c = cos(a)
+        val s = sin(a)
+        val rx = if (frontFacing) -1.0 else 1.0 // scene-right along device x
+        return doubleArrayOf(c * rx, -s, 0.0, -s * rx, -c, 0.0, 0.0, 0.0, if (frontFacing) 1.0 else -1.0)
+    }
+
+    /** Angle between two rotations, degrees. */
+    fun angleBetween(a: DoubleArray, b: DoubleArray): Double {
+        val d = Mat3.mul(a, Mat3.transpose(b))
+        return Math.toDegrees(acos(((d[0] + d[4] + d[8] - 1) / 2).coerceIn(-1.0, 1.0)))
+    }
+
+    class Direction(val x: Double, val y: Double, val votes: Int)
+
+    /**
+     * Direction along which matched points are displaced by depth. After the two images are
+     * aligned on the dominant surface, every remaining displacement is parallax, which runs
+     * along the baseline. [residuals]: displacement vectors, x y flattened.
+     * Null when there is no clear common direction.
+     */
+    fun parallaxDirection(
+        residuals: DoubleArray,
+        maxLen: Double,
+        minLen: Double = 4.0,
+        tol: Double = 1.5,
+        maxCandidates: Int = 200,
+    ): Direction? {
+        val xs = ArrayList<Double>()
+        val ys = ArrayList<Double>()
+        for (i in 0 until residuals.size / 2) {
+            val len = hypot(residuals[i * 2], residuals[i * 2 + 1])
+            if (len > minLen && len < maxLen) {
+                xs += residuals[i * 2]
+                ys += residuals[i * 2 + 1]
+            }
+        }
+        val n = xs.size
+        if (n < MIN_INLIERS) return null
+        fun onLine(i: Int, ux: Double, uy: Double) = abs(xs[i] * uy - ys[i] * ux) < tol
+        var bestCount = 0
+        var bx = 0.0
+        var by = 0.0
+        for (c in 0 until n step max(1, n / maxCandidates)) {
+            val len = hypot(xs[c], ys[c])
+            val ux = xs[c] / len
+            val uy = ys[c] / len
+            val count = (0 until n).count { onLine(it, ux, uy) }
+            if (count > bestCount) {
+                bestCount = count
+                bx = ux
+                by = uy
+            }
+        }
+        if (bestCount < MIN_INLIERS || bestCount < 0.5 * n) return null
+        var sxx = 0.0
+        var sxy = 0.0
+        var syy = 0.0
+        for (i in 0 until n) {
+            if (!onLine(i, bx, by)) continue
+            sxx += xs[i] * xs[i]
+            sxy += xs[i] * ys[i]
+            syy += ys[i] * ys[i]
+        }
+        val angle = 0.5 * atan2(2 * sxy, sxx - syy) // principal axis of the scatter
+        return Direction(cos(angle), sin(angle), bestCount)
+    }
+
+    /** Rotation vector (axis * angle, radians) -> rotation matrix. */
+    fun rodrigues(w: DoubleArray): DoubleArray {
+        val angle = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
+        if (angle < 1e-12) return Mat3.identity
+        val k = DoubleArray(3) { w[it] / angle }
+        val kx = doubleArrayOf(0.0, -k[2], k[1], k[2], 0.0, -k[0], -k[1], k[0], 0.0)
+        val kx2 = Mat3.mul(kx, kx)
+        val id = Mat3.identity
+        return DoubleArray(9) { id[it] + sin(angle) * kx[it] + (1 - cos(angle)) * kx2[it] }
+    }
+
+    /**
+     * Camera rotation that explains a measured image-to-image similarity [m] (2x3, row-major)
+     * taking aux pixels onto ref pixels, both at focal [f] and principal point [cx], [cy].
+     * Returns (R, scale): R rotates aux rays into the ref frame.
+     */
+    fun rotationFromSimilarity(m: DoubleArray, f: Double, cx: Double, cy: Double): Pair<DoubleArray, Double> {
+        val scale = hypot(m[0], m[3])
+        val roll = atan2(m[3], m[0])
+        val qx = m[0] * cx + m[1] * cy + m[2]
+        val qy = m[3] * cx + m[4] * cy + m[5]
+        val v = normalize(doubleArrayOf((qx - cx) / f, (qy - cy) / f, 1.0))
+        // smallest rotation taking the optical axis onto v: about (z cross v) by asin(|z cross v|)
+        val sinA = hypot(v[0], v[1])
+        val point = if (sinA < 1e-12) Mat3.identity else {
+            val a = asin(sinA.coerceAtMost(1.0))
+            rodrigues(doubleArrayOf(-v[1] / sinA * a, v[0] / sinA * a, 0.0))
+        }
+        val rz = doubleArrayOf(cos(roll), -sin(roll), 0.0, sin(roll), cos(roll), 0.0, 0.0, 0.0, 1.0)
+        return Mat3.mul(point, rz) to scale
+    }
+
+    /**
+     * Least-squares polish of a rotation [r] taking aux rays (x y z flattened) onto ref points
+     * ([target], normalised image coordinates, x y flattened). [mask] says which pairs to trust
+     * in the first round; later rounds use every pair that agrees within [tol].
+     * Returns (rotation, number of agreeing pairs).
+     */
+    fun refineRotation(
+        r: DoubleArray,
+        raysAux: DoubleArray,
+        target: DoubleArray,
+        mask: BooleanArray,
+        tol: Double,
+        iterations: Int = 3,
+    ): Pair<DoubleArray, Int> {
+        val n = target.size / 2
+        var rot = r
+        val xy = DoubleArray(n * 2)
+        fun project() {
+            for (i in 0 until n) {
+                val q = Mat3.mulVec(rot, doubleArrayOf(raysAux[i * 3], raysAux[i * 3 + 1], raysAux[i * 3 + 2]))
+                xy[i * 2] = q[0] / q[2]
+                xy[i * 2 + 1] = q[1] / q[2]
+            }
+        }
+        fun agrees(i: Int) = hypot(target[i * 2] - xy[i * 2], target[i * 2 + 1] - xy[i * 2 + 1]) < tol
+        var use = mask
+        for (round in 0 until iterations) {
+            project()
+            if (round > 0) use = BooleanArray(n) { agrees(it) }
+            if (use.count { it } < MIN_INLIERS) break
+            val ata = DoubleArray(9)
+            val atb = DoubleArray(3)
+            for (i in 0 until n) {
+                if (!use[i]) continue
+                val x = xy[i * 2]
+                val y = xy[i * 2 + 1]
+                // effect of a small extra rotation on the projected point
+                val rows = arrayOf(
+                    doubleArrayOf(-x * y, 1 + x * x, -y) to target[i * 2] - x,
+                    doubleArrayOf(-(1 + y * y), x * y, x) to target[i * 2 + 1] - y,
+                )
+                for ((j, d) in rows) for (a in 0..2) {
+                    atb[a] += j[a] * d
+                    for (b in 0..2) ata[a * 3 + b] += j[a] * j[b]
+                }
+            }
+            val w = Mat3.solve(ata, atb) ?: break
+            rot = Mat3.mul(rodrigues(w), rot)
+        }
+        project()
+        return rot to (0 until n).count { agrees(it) }
+    }
 
     private fun normalize(v: DoubleArray): DoubleArray {
         val n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])

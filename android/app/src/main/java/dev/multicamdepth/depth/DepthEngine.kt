@@ -23,6 +23,7 @@ import org.opencv.features2d.BFMatcher
 import org.opencv.features2d.ORB
 import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.hypot
@@ -46,13 +47,33 @@ class DepthResult(
 
 /**
  * Rectify -> semi-global matching -> depth, for one stereo rig.
- * Same steps as tools/mcdepth/pipeline.py. Use from a single thread.
+ * Same steps as StereoDepth in tools/mcdepth/pipeline.py. Use from a single thread.
  */
 class DepthEngine(private val rig: StereoRig, private val outW: Int, private val outH: Int, sensorOrientation: Int) {
-    val rect: Rectification = StereoGeometry.rectify(rig.r, rig.t)
     val focal = StereoGeometry.rectifiedFocal(rig.ref, rig.aux, outW)
-    private val kNew = doubleArrayOf(focal, 0.0, outW / 2.0, 0.0, focal, outH / 2.0, 0.0, 0.0, 1.0)
-    val numDisparities = maxOf(16, ceil((if (rect.vertical) outH else outW) / 5.0 / 16).toInt() * 16)
+    private val cx = outW / 2.0
+    private val cy = outH / 2.0
+    private val kNew = doubleArrayOf(focal, 0.0, cx, 0.0, focal, cy, 0.0, 0.0, 1.0)
+    private val refK = rig.ref.k.let { doubleArrayOf(it.fx, 0.0, it.cx, 0.0, it.fy, it.cy, 0.0, 0.0, 1.0) }
+    private val nominalAuxK = rig.aux.k.let { doubleArrayOf(it.fx, 0.0, it.cx, 0.0, it.fy, it.cy, 0.0, 0.0, 1.0) }
+
+    // ---- geometry in use: the calibration as given, or measured from the images ----
+    lateinit var rect: Rectification
+        private set
+    var numDisparities = 16
+        private set
+    private var auxK = nominalAuxK
+    private var correction = Mat3.identity
+    private var baselineSign = 1.0 // -1: the images show the reported camera order is reversed
+    private var sgbm: StereoSGBM? = null
+
+    /** true once [refine] has succeeded */
+    var aligned = false
+        private set
+
+    /** true if the geometry was measured from the images: depth is then relative, not metres */
+    var selfCalibrated = false
+        private set
 
     private val rotateCode = when (sensorOrientation) {
         90 -> Core.ROTATE_90_CLOCKWISE
@@ -65,24 +86,41 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private val refMap2 = Mat()
     private val auxMap1 = Mat()
     private val auxMap2 = Mat()
-    private val sgbm = StereoSGBM.create(
-        0, numDisparities, BLOCK, 8 * BLOCK * BLOCK, 32 * BLOCK * BLOCK,
-        1, 0, 10, 100, 2, StereoSGBM.MODE_SGBM_3WAY,
-    )
     private val rectRef = Mat()
     private val rectAux = Mat()
+    private var previous: Mat? = null // last disparity, for temporal smoothing
 
     init {
-        buildMap(rig.ref.k.let { doubleArrayOf(it.fx, 0.0, it.cx, 0.0, it.fy, it.cy, 0.0, 0.0, 1.0) }, rig.ref.dist, rect.r1, kNew, refMap1, refMap2)
-        buildAuxMap(Mat3.identity)
+        reset()
     }
 
-    private fun buildAuxMap(correction: DoubleArray) {
-        val k = rig.aux.k
-        buildMap(
-            doubleArrayOf(k.fx, 0.0, k.cx, 0.0, k.fy, k.cy, 0.0, 0.0, 1.0),
-            rig.aux.dist, rect.r2, Mat3.mul(correction, kNew), auxMap1, auxMap2,
-        )
+    /** Back to the calibration as given. */
+    private fun reset() {
+        correction = Mat3.identity
+        baselineSign = 1.0
+        selfCalibrated = false
+        setGeometry(rig.r, rig.t, nominalAuxK)
+    }
+
+    private fun setGeometry(r: DoubleArray, t: DoubleArray, auxCameraMatrix: DoubleArray) {
+        auxK = auxCameraMatrix
+        rect = StereoGeometry.rectify(r, t)
+        val n = maxOf(16, ceil((if (rect.vertical) outH else outW) / 5.0 / 16).toInt() * 16)
+        if (n != numDisparities || sgbm == null) {
+            numDisparities = n
+            sgbm = StereoSGBM.create(
+                0, n, BLOCK, 8 * BLOCK * BLOCK, 32 * BLOCK * BLOCK,
+                1, 0, 10, 100, 2, StereoSGBM.MODE_SGBM_3WAY,
+            )
+        }
+        buildMaps()
+    }
+
+    private fun buildMaps() {
+        buildMap(refK, rig.ref.dist, rect.r1, kNew, refMap1, refMap2)
+        buildMap(auxK, rig.aux.dist, rect.r2, Mat3.mul(correction, kNew), auxMap1, auxMap2)
+        previous?.release()
+        previous = null
     }
 
     private fun buildMap(k: DoubleArray, dist: DoubleArray, r: DoubleArray, newK: DoubleArray, map1: Mat, map2: Mat) {
@@ -103,82 +141,72 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         b.release()
     }
 
-    /** true once [refine] has succeeded for the current calibration */
-    var aligned = false
-        private set
-
-    /** true if alignment needed the coarse fallback: depth is then relative, not metres */
-    var selfCalibrated = false
-        private set
-
-    private var correction = Mat3.identity
-    private var baselineSign = 1.0 // -1: the images show the reported camera order is reversed
-    private var coarseNote = ""
-    private var lastUsable = 0
-    private var previous: Mat? = null // last disparity, for temporal smoothing
+    // ---- alignment from image content -------------------------------------------------
 
     private class Matches(val p1: DoubleArray, val p2: DoubleArray) {
         val size get() = p1.size / 2
     }
 
+    private class Fine(val applied: Boolean, val matches: Int, val usable: Int, val inliers: Int, val flipped: Boolean)
+
     /**
-     * Aligns the rectified pair using feature matches; same logic as StereoDepth.refine in
-     * tools/mcdepth/pipeline.py. Always restarts from the nominal calibration.
-     * Returns a one-line summary for the status display.
+     * Aligns the rectified pair using feature matches.
+     *
+     * 1. Fine: fit the leftover row misalignment, assuming the calibration is nearly right.
+     *    Also detects a baseline that points the wrong way.
+     * 2. Self-calibration, if 1 fails or only lines up a minority of the matches: the
+     *    calibration is unusable, which is common on phones that publish placeholder values.
+     *    Measure how the second camera is rotated against the first and in which direction
+     *    parallax runs, rebuild the geometry from that, then run 1 again. Depth is then relative.
+     *
+     * Always restarts from the calibration as given. Returns a summary for the status display.
      */
     fun refine(ref: Frame, aux: Frame): String {
-        setCorrection(Mat3.identity)
-        baselineSign = 1.0
-        selfCalibrated = false
         aligned = false
-        previous?.release()
-        previous = null
-
-        val first = match(ref, aux)
-        var note = fine(first)
-        if (note == null) {
-            val coarse = coarse(first)
-            if (coarse != null) {
-                setCorrection(coarse)
-                note = fine(match(ref, aux))
-                if (note != null) {
-                    selfCalibrated = true
-                    note += "\ncalibration far off ($coarseNote): depth is relative"
-                } else {
-                    setCorrection(Mat3.identity)
-                }
+        reset()
+        val first = fine(ref, aux)
+        if (first.applied && first.inliers >= 0.5 * first.usable) return done(first, null)
+        reset()
+        val detail = selfCalibrate(ref, aux)
+        if (detail != null) {
+            val second = fine(ref, aux)
+            if (second.applied && second.inliers >= first.inliers) {
+                selfCalibrated = true
+                return done(second, detail)
             }
         }
-        aligned = note != null
-        return note ?: "not aligned yet (${first.size} matches, $lastUsable fit the calibration), retrying"
+        reset()
+        if (first.applied) return done(fine(ref, aux), null)
+        return "not aligned yet (${first.matches} matches, ${first.usable} fit the calibration), retrying"
     }
 
-    private fun setCorrection(c: DoubleArray) {
-        correction = c
-        buildAuxMap(c)
+    private fun done(f: Fine, detail: String?): String {
+        aligned = f.applied
+        return "aligned on ${f.inliers} of ${f.usable} features" +
+            (if (f.flipped) ", camera order corrected" else "") +
+            (if (detail != null) "\nself-calibrated, depth is relative\n$detail" else "")
     }
 
-    private fun match(ref: Frame, aux: Frame): Matches {
-        rectify(ref, aux)
+    private fun match(a: Mat, b: Mat): Matches {
         val orb = ORB.create(1500)
         val k1 = MatOfKeyPoint()
         val k2 = MatOfKeyPoint()
         val d1 = Mat()
         val d2 = Mat()
         val none = Mat()
-        orb.detectAndCompute(rectRef, none, k1, d1)
-        orb.detectAndCompute(rectAux, none, k2, d2)
+        orb.detectAndCompute(a, none, k1, d1)
+        orb.detectAndCompute(b, none, k2, d2)
         val p1 = ArrayList<Double>()
         val p2 = ArrayList<Double>()
         if (!d1.empty() && !d2.empty()) {
             val matches = MatOfDMatch()
             BFMatcher.create(Core.NORM_HAMMING, true).match(d1, d2, matches)
-            val a = k1.toArray()
-            val b = k2.toArray()
+            val ka = k1.toArray()
+            val kb = k2.toArray()
             for (m in matches.toArray()) {
                 if (m.distance >= 64) continue
-                p1 += a[m.queryIdx].pt.x; p1 += a[m.queryIdx].pt.y
-                p2 += b[m.trainIdx].pt.x; p2 += b[m.trainIdx].pt.y
+                p1 += ka[m.queryIdx].pt.x; p1 += ka[m.queryIdx].pt.y
+                p2 += kb[m.trainIdx].pt.x; p2 += kb[m.trainIdx].pt.y
             }
             matches.release()
         }
@@ -186,8 +214,10 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         return Matches(p1.toDoubleArray(), p2.toDoubleArray())
     }
 
-    /** Fits the leftover row misalignment on top of the current correction. Null if it fails. */
-    private fun fine(m: Matches): String? {
+    /** Fits the leftover row misalignment on top of the geometry in use. */
+    private fun fine(ref: Frame, aux: Frame): Fine {
+        rectify(ref, aux)
+        val m = match(rectRef, rectAux)
         val ax = if (rect.vertical) 1 else 0
         val other = 1 - ax
         val limit = 0.05 * (if (rect.vertical) outW else outH)
@@ -205,53 +235,131 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         val usable = rows.filter { along(it) * s > -limit && along(it) * s < numDisparities + limit }
         val q1 = DoubleArray(usable.size * 2) { m.p1[usable[it / 2] * 2 + it % 2] }
         val q2 = DoubleArray(usable.size * 2) { m.p2[usable[it / 2] * 2 + it % 2] }
-        lastUsable = usable.size
-        val fit = StereoGeometry.fitRowAlignment(q1, q2, rect.vertical, outW / 2.0, outH / 2.0)
-        val h = fit.homography ?: return null
-        setCorrection(Mat3.mul(h, correction))
+        val fit = StereoGeometry.fitRowAlignment(q1, q2, rect.vertical, cx, cy)
+        val h = fit.homography ?: return Fine(false, m.size, usable.size, fit.inliers, false)
+        correction = Mat3.mul(h, correction)
         baselineSign = s
-        return "aligned on ${fit.inliers} features" + if (flip) ", camera order corrected" else ""
+        buildMaps()
+        return Fine(true, m.size, usable.size, fit.inliers, flip)
     }
 
     /**
-     * For a calibration that is badly off: similarity transform taking aux points onto ref
-     * points, with the offset along the baseline chosen so every disparity stays positive.
+     * Rebuilds the stereo geometry from the images. Returns a description, or null if the
+     * scene does not allow it (then nothing has changed).
      */
-    private fun coarse(m: Matches): DoubleArray? {
-        if (m.size < 20) return null
-        val from = MatOfPoint2f(*Array(m.size) { Point(m.p2[it * 2], m.p2[it * 2 + 1]) })
-        val to = MatOfPoint2f(*Array(m.size) { Point(m.p1[it * 2], m.p1[it * 2 + 1]) })
-        val inliers = Mat()
-        val affine = Calib3d.estimateAffinePartial2D(from, to, inliers, Calib3d.RANSAC, 3.0)
-        val count = if (inliers.empty()) 0 else Core.countNonZero(inliers)
-        val a = DoubleArray(6)
-        if (!affine.empty()) affine.get(0, 0, a)
-        listOf(from, to, inliers, affine).forEach { it.release() }
-        if (count < 15) return null
-        val scale = hypot(a[0], a[3])
-        val angle = Math.toDegrees(atan2(a[3], a[0]))
-        if (scale <= 0.5 || scale >= 2.0 || abs(angle) > 15) return null
+    private fun selfCalibrate(ref: Frame, aux: Frame): String? {
+        // both images at the shared focal length, otherwise untouched
+        val a = plain(ref, refK, rig.ref.dist)
+        val b = plain(aux, nominalAuxK, rig.aux.dist)
+        val m = match(a, b)
+        a.release()
+        b.release()
+        val n = m.size
+        if (n < 20) return null
 
+        val from = MatOfPoint2f(*Array(n) { Point(m.p2[it * 2], m.p2[it * 2 + 1]) })
+        val to = MatOfPoint2f(*Array(n) { Point(m.p1[it * 2], m.p1[it * 2 + 1]) })
+        val inlierMat = Mat()
+        val affine = Calib3d.estimateAffinePartial2D(from, to, inlierMat, Calib3d.RANSAC, 3.0)
+        val sim = DoubleArray(6)
+        val flags = ByteArray(n)
+        val ok = !affine.empty() && inlierMat.total() == n.toLong()
+        if (ok) {
+            affine.get(0, 0, sim)
+            inlierMat.get(0, 0, flags)
+        }
+        listOf(from, to, inlierMat, affine).forEach { it.release() }
+        if (!ok || flags.count { it.toInt() != 0 } < 15) return null
+
+        // as a camera rotation plus a focal-length correction, which unlike the 2D fit is
+        // also right towards the image edges
+        val (rough, scale) = StereoGeometry.rotationFromSimilarity(sim, focal, cx, cy)
+        val rays1 = DoubleArray(n * 2) { (m.p1[it] - if (it % 2 == 0) cx else cy) / focal }
+        val rays2 = DoubleArray(n * 3) {
+            when (it % 3) {
+                0 -> (m.p2[it / 3 * 2] - cx) / focal * scale
+                1 -> (m.p2[it / 3 * 2 + 1] - cy) / focal * scale
+                else -> 1.0
+            }
+        }
+        val (rH, agree) = StereoGeometry.refineRotation(rough, rays2, rays1, BooleanArray(n) { flags[it].toInt() != 0 }, 2.0 / focal)
+        val angle = Math.toDegrees(acos(((rH[0] + rH[4] + rH[8] - 1) / 2).coerceIn(-1.0, 1.0)))
+        if (agree < 15 || scale <= 0.5 || scale >= 2.0 || angle > 20) return null
+
+        fun project(rot: DoubleArray, x: Double, y: Double, z: Double): DoubleArray {
+            val q = Mat3.mulVec(rot, doubleArrayOf(x, y, z))
+            return doubleArrayOf(q[0] / q[2] * focal + cx, q[1] / q[2] * focal + cy)
+        }
+        fun ray2(i: Int) = Triple(rays2[i * 3], rays2[i * 3 + 1], rays2[i * 3 + 2])
+
+        // direction of the baseline in the image: measured from parallax if the scene has
+        // any, otherwise as reported. Its sign always comes from the report.
+        val residuals = DoubleArray(n * 2)
+        for (i in 0 until n) {
+            val (x, y, z) = ray2(i)
+            val moved = project(rH, x, y, z)
+            residuals[i * 2] = m.p1[i * 2] - moved[0]
+            residuals[i * 2 + 1] = m.p1[i * 2 + 1] - moved[1]
+        }
+        val c2 = Mat3.mulVec(Mat3.transpose(rig.r), rig.t).map { -it }
+        val hintLen = hypot(c2[0], c2[1]).coerceAtLeast(1e-12)
+        var dx = c2[0] / hintLen
+        var dy = c2[1] / hintLen
+        val measured = StereoGeometry.parallaxDirection(residuals, maxOf(outW, outH) / 5.0)
+        if (measured != null) {
+            val s = if (measured.x * dx + measured.y * dy < 0) -1.0 else 1.0
+            dx = measured.x * s
+            dy = measured.y * s
+        }
+        val baseline = hypot(hypot(c2[0], c2[1]), c2[2])
+        val rRel = Mat3.transpose(rH)
+        val t = Mat3.mulVec(rRel, doubleArrayOf(dx, dy, 0.0)).map { -baseline * it }.toDoubleArray()
+        val scaledAuxK = nominalAuxK.copyOf().also {
+            it[0] /= scale
+            it[4] /= scale
+        }
+        setGeometry(rRel, t, scaledAuxK)
+
+        // the fit put the dominant surface at zero disparity, so anything farther would be
+        // negative: shift until the farthest matched points sit just above zero
         val ax = if (rect.vertical) 1 else 0
         val other = 1 - ax
-        val nominal = sign(rect.baseline)
+        val sgn = sign(rect.baseline)
         val d = ArrayList<Double>()
-        for (i in 0 until m.size) {
-            val x = m.p2[i * 2]
-            val y = m.p2[i * 2 + 1]
-            val moved = doubleArrayOf(a[0] * x + a[1] * y + a[2], a[3] * x + a[4] * y + a[5])
-            if (abs(moved[other] - m.p1[i * 2 + other]) >= 3.0) continue
-            val v = (m.p1[i * 2 + ax] - moved[ax]) * nominal
+        for (i in 0 until n) {
+            val (x, y, z) = ray2(i)
+            val r1 = project(rect.r1, rays1[i * 2], rays1[i * 2 + 1], 1.0)
+            val r2 = project(rect.r2, x, y, z)
+            if (abs(r1[other] - r2[other]) >= 3.0) continue
+            val v = (r1[ax] - r2[ax]) * sgn
             if (abs(v) < numDisparities) d += v
         }
-        if (d.size < 15) return null
+        if (d.size < 15) {
+            reset()
+            return null
+        }
         d.sort()
-        val shift = 2.0 - d[(d.size * 0.02).toInt()]
-        val h = doubleArrayOf(a[0], a[1], a[2], a[3], a[4], a[5], 0.0, 0.0, 1.0)
-        h[ax * 3 + 2] -= shift * nominal
-        coarseNote = "scale %.3f, rot %.1f deg, offset %.0f,%.0f px".format(scale, angle, a[2], a[5])
-        return h
+        correction = Mat3.identity.also { it[ax * 3 + 2] = -(2.0 - d[(d.size * 0.02).toInt()]) * sgn }
+        buildMaps()
+        return "second camera: rotated %.1f deg, focal x%.3f\nbaseline direction in image: %.0f deg (%s)".format(
+            angle, 1 / scale, Math.toDegrees(atan2(dy, dx)),
+            if (measured != null) "measured, ${measured.votes} votes" else "as reported, scene too flat to measure",
+        )
     }
+
+    /** A frame resampled to the shared camera matrix, without any rotation. */
+    private fun plain(frame: Frame, k: DoubleArray, dist: DoubleArray): Mat {
+        val map1 = Mat()
+        val map2 = Mat()
+        buildMap(k, dist, Mat3.identity, kNew, map1, map2)
+        val src = gray(frame)
+        val out = Mat()
+        Imgproc.remap(src, out, map1, map2, Imgproc.INTER_LINEAR)
+        listOf(map1, map2, src).forEach { it.release() }
+        return out
+    }
+
+    // ---- depth -----------------------------------------------------------------------
 
     fun compute(ref: Frame, aux: Frame, view: View = View.REFERENCE): DepthResult {
         val start = System.nanoTime()
@@ -272,7 +380,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         if (flipped) both { s, d -> Core.flip(s, d, 1) }
 
         val disp = Mat() // CV_16S, disparity * 16
-        sgbm.compute(left, right, disp)
+        sgbm!!.compute(left, right, disp)
         if (flipped) Core.flip(disp, disp, 1)
         if (rect.vertical) {
             val t = Mat()

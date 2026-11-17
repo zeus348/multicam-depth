@@ -28,16 +28,19 @@ to fix things on first run; the info panel in the app prints what the phone repo
    (Camera2 `setPhysicalCameraId`). The narrower lens becomes the reference.
 2. **Calibration from the phone.** Intrinsics, distortion and lens poses are read from
    `CameraCharacteristics`. Missing intrinsics are derived from focal length and sensor
-   size. If no lens positions are published, a 12 mm baseline is assumed, depth is
-   labelled relative, and a button cycles the assumed camera layout.
+   size. Many phones publish placeholders (identical rotations, lens spacings of a
+   millimetre or two); these are detected and only their direction is kept.
 3. **Rectify.** Both images are warped so that a scene point lands on the same row
    (or column, for cameras stacked along the image's y axis) at the narrower lens's
    focal length.
-4. **Re-align from image content.** Factory calibration is rarely good to a pixel, so
-   ORB feature matches are used to fit and remove the leftover row misalignment, and to
-   detect a camera order that is reported the wrong way round. If the calibration is
-   too far off for that, a coarse fit of scale, rotation and offset is applied first;
-   depth is then labelled relative. The app retries until an alignment succeeds.
+4. **Align from image content.** ORB feature matches are used to fit and remove the
+   leftover row misalignment, and to detect a camera order reported the wrong way round.
+   If that lines up only a minority of the matches, the calibration is treated as
+   unusable and the geometry is measured instead: the second camera's rotation and
+   focal-length error from how the dominant surface maps between the images, and the
+   baseline direction from the direction of parallax. Depth is then labelled relative,
+   because the true lens spacing and the zero-disparity point are unknown. The app
+   retries until an alignment succeeds.
 5. **Match.** OpenCV semi-global block matching gives disparity `d`; depth is
    `focal_px * baseline / d`.
 

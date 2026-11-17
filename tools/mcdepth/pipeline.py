@@ -33,15 +33,24 @@ class StereoDepth:
     def __init__(self, rig: StereoRig, out_size: tuple[int, int] | None = None, max_disparity: int | None = None):
         self.rig = rig
         self.out_w, self.out_h = out_size or (rig.ref.width, rig.ref.height)
-        self.rect = geometry.rectify(rig.r, rig.t)
         self.k_new = geometry.rectified_camera_matrix(
             rig.ref.k[0, 0], rig.ref.width, rig.aux.k[0, 0], rig.aux.width, self.out_w, self.out_h
         )
+        self.max_disparity = max_disparity
+        self._reset()
+
+    def _reset(self):
+        """Back to the calibration as given."""
         self.correction = np.eye(3)
         self.baseline_sign = 1.0  # -1 if the images show the reported camera order is reversed
-        self.self_calibrated = False  # True if depth is only relative after a coarse fit
+        self.self_calibrated = False  # True if the geometry was measured from the images: depth is relative
+        self._set_geometry(self.rig.r, self.rig.t, self.rig.aux.k)
+
+    def _set_geometry(self, r, t, aux_k):
+        self.aux_k = aux_k
+        self.rect = geometry.rectify(r, t)
         along = self.out_h if self.rect.vertical else self.out_w
-        nd = max_disparity or along // 5
+        nd = self.max_disparity or along // 5
         self.num_disparities = max(16, int(np.ceil(nd / 16)) * 16)
         self._build_maps()
 
@@ -51,7 +60,7 @@ class StereoDepth:
         rig = self.rig
         self.map_ref = cv2.initUndistortRectifyMap(rig.ref.k, rig.ref.dist, self.rect.r1, self.k_new, size, cv2.CV_16SC2)
         self.map_aux = cv2.initUndistortRectifyMap(
-            rig.aux.k, rig.aux.dist, self.rect.r2, self.correction @ self.k_new, size, cv2.CV_16SC2
+            self.aux_k, rig.aux.dist, self.rect.r2, self.correction @ self.k_new, size, cv2.CV_16SC2
         )
 
     def rectify(self, img_ref, img_aux):
@@ -65,34 +74,107 @@ class StereoDepth:
 
         1. Fine: fit the leftover row misalignment, assuming the calibration is
            nearly right. Also detects a baseline that points the wrong way.
-        2. Coarse (only if 1 fails): the calibration is badly off, so first fit
-           scale, rotation and offset between the images, then run 1 again.
-           Depth is then no longer metric (self.self_calibrated is set).
+        2. Self-calibration (only if 1 fails): the calibration is unusable, which is
+           common on phones that publish placeholder values. Measure how the second
+           image is scaled, rotated and shifted against the first, and in which
+           direction parallax runs, rebuild the geometry from that, then run 1 again.
+           Depth is then relative, not metric (self.self_calibrated is set).
 
-        Always starts from the nominal calibration, so repeated calls do not
+        Always starts from the calibration as given, so repeated calls do not
         accumulate error."""
-        self.correction = np.eye(3)
-        self.baseline_sign = 1.0
-        self.self_calibrated = False
-        self._build_maps()
+        self._reset()
         gray_ref, gray_aux = _gray(img_ref), _gray(img_aux)
-        info = self._fine(gray_ref, gray_aux)
-        if not info["applied"]:
-            coarse = self._coarse(info.pop("_p1"), info.pop("_p2"))
-            if coarse is not None:
-                self.correction = coarse
-                self._build_maps()
-                second = self._fine(gray_ref, gray_aux)
-                if second["applied"]:
-                    self.self_calibrated = True
-                    info = second
-                    info["coarse"] = True
-                else:
-                    self.correction = np.eye(3)
-                    self._build_maps()
-        info.pop("_p1", None)
-        info.pop("_p2", None)
-        return info
+        first = self._fine(gray_ref, gray_aux)
+        # A wrong calibration can still line up one surface of the scene; a right one
+        # lines up most of it.
+        if first["applied"] and first["inliers"] >= 0.5 * first["usable"]:
+            return first
+        self._reset()
+        detail = self._self_calibrate(gray_ref, gray_aux)
+        if detail is not None:
+            second = self._fine(gray_ref, gray_aux)
+            if second["applied"] and second["inliers"] >= first["inliers"]:
+                self.self_calibrated = True
+                return {**second, **detail, "self_calibrated": True}
+        self._reset()
+        return self._fine(gray_ref, gray_aux) if first["applied"] else first
+
+    def _self_calibrate(self, gray_ref, gray_aux):
+        size = (self.out_w, self.out_h)
+        rig = self.rig
+        eye = np.eye(3)
+        # both images at the shared focal length, otherwise untouched
+        a = cv2.remap(gray_ref, *cv2.initUndistortRectifyMap(rig.ref.k, rig.ref.dist, eye, self.k_new, size, cv2.CV_16SC2), cv2.INTER_LINEAR)
+        b = cv2.remap(gray_aux, *cv2.initUndistortRectifyMap(rig.aux.k, rig.aux.dist, eye, self.k_new, size, cv2.CV_16SC2), cv2.INTER_LINEAR)
+        p1, p2 = match_features(a, b)
+        if len(p1) < 20:
+            return None
+        m, inl = cv2.estimateAffinePartial2D(
+            p2.astype(np.float32), p1.astype(np.float32), method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+        if m is None or inl.sum() < 15:
+            return None
+        f, cx, cy = self.k_new[0, 0], self.k_new[0, 2], self.k_new[1, 2]
+        # as a camera rotation plus a focal-length correction, which unlike the 2D fit
+        # is also right towards the image edges
+        r_h, scale = geometry.rotation_from_similarity(m, f, cx, cy)
+        angle = float(np.degrees(np.arccos(np.clip((np.trace(r_h) - 1) / 2, -1, 1))))
+        if not 0.5 < scale < 2.0 or angle > 20:
+            return None
+        k_inv = np.linalg.inv(self.k_new)
+        rays1 = np.c_[p1, np.ones(len(p1))] @ k_inv.T
+        rays2 = np.c_[p2, np.ones(len(p2))] @ k_inv.T * [scale, scale, 1.0]  # aux rays
+        r_h, agree = geometry.refine_rotation(r_h, rays2, rays1[:, :2], inl.ravel() > 0, tol=2.0 / f)
+        if agree < 15:
+            return None
+        in_ref = rays2 @ r_h.T
+        moved = in_ref[:, :2] / in_ref[:, 2:] * f + [cx, cy]
+
+        # direction of the baseline in the image: measured from parallax if the scene
+        # has any, otherwise as reported. Its sign always comes from the report.
+        c2 = -rig.r.T @ rig.t
+        hint = c2[:2] / max(np.linalg.norm(c2[:2]), 1e-12)
+        limit = max(self.out_w, self.out_h) / 5.0
+        direction, votes = geometry.parallax_direction(p1 - moved, max_len=limit)
+        measured = direction is not None
+        if not measured:
+            direction = hint
+        elif direction @ hint < 0:
+            direction = -direction
+        baseline = float(np.linalg.norm(c2))
+        r_rel = r_h.T
+        aux_k = rig.aux.k.copy()
+        aux_k[0, 0] /= scale
+        aux_k[1, 1] /= scale
+        self._set_geometry(r_rel, -baseline * r_rel @ np.array([direction[0], direction[1], 0.0]), aux_k)
+
+        # the fit put the dominant surface at zero disparity, so anything farther would
+        # be negative: shift until the farthest matched points sit just above zero
+        def project(rot, rays):
+            q = rays @ rot.T
+            return q[:, :2] / q[:, 2:] * f + [cx, cy]
+
+        ax, other = self.rect.axis, 1 - self.rect.axis
+        r1 = project(self.rect.r1, rays1)
+        r2 = project(self.rect.r2, rays2)
+        sign = np.sign(self.rect.baseline)
+        row = np.abs(r1[:, other] - r2[:, other]) < 3.0
+        d = (r1[row, ax] - r2[row, ax]) * sign
+        d = d[np.abs(d) < self.num_disparities]
+        if len(d) < 15:
+            self._reset()
+            return None
+        self.correction = np.eye(3)
+        self.correction[ax, 2] = -(2.0 - np.percentile(d, 2)) * sign
+        self._build_maps()
+        return {
+            "scale": scale,
+            "rotation_deg": angle,
+            "offset_px": [float(m[0, 2]), float(m[1, 2])],
+            "baseline_direction": [float(direction[0]), float(direction[1])],
+            "direction_measured": measured,
+            "direction_votes": votes,
+        }
 
     def _usable(self, p1, p2, sign):
         """Matches that could be a stereo correspondence for a baseline pointing along `sign`."""
@@ -104,7 +186,7 @@ class StereoDepth:
     def _fine(self, gray_ref, gray_aux) -> dict:
         rect_ref, rect_aux = self.rectify(gray_ref, gray_aux)
         p1, p2 = match_features(rect_ref, rect_aux)
-        info = {"matches": len(p1), "usable": 0, "inliers": 0, "applied": False, "_p1": p1, "_p2": p2}
+        info = {"matches": len(p1), "usable": 0, "inliers": 0, "applied": False}
         if not len(p1):
             return info
         nominal = np.sign(self.rect.baseline)
@@ -128,34 +210,6 @@ class StereoDepth:
             info["applied"] = True
             info["baseline_flipped"] = sign < 0
         return info
-
-    def _coarse(self, p1, p2):
-        """Similarity transform taking aux points onto ref points, with the offset along
-        the baseline chosen so that every disparity stays positive. None if unreliable."""
-        if len(p1) < 20:
-            return None
-        m, inl = cv2.estimateAffinePartial2D(
-            p2.astype(np.float32), p1.astype(np.float32), method=cv2.RANSAC, ransacReprojThreshold=3.0
-        )
-        if m is None or inl.sum() < 15:
-            return None
-        scale = float(np.hypot(m[0, 0], m[1, 0]))
-        angle = float(np.degrees(np.arctan2(m[1, 0], m[0, 0])))
-        if not 0.5 < scale < 2.0 or abs(angle) > 15:
-            return None
-        h = np.vstack([m, [0, 0, 1.0]])
-        # the fit put the dominant surface at zero disparity; anything farther would be
-        # negative. Shift so the farthest matched points sit just above zero.
-        ax, other = self.rect.axis, 1 - self.rect.axis
-        moved = p2 @ m[:, :2].T + m[:, 2]
-        near_row = np.abs(moved[:, other] - p1[:, other]) < 3.0
-        d = (p1[near_row, ax] - moved[near_row, ax]) * np.sign(self.rect.baseline)
-        d = d[np.abs(d) < self.num_disparities]
-        if len(d) < 15:
-            return None
-        shift = 2.0 - np.percentile(d, 2)
-        h[ax, 2] -= shift * np.sign(self.rect.baseline)
-        return h
 
     # ---- matching --------------------------------------------------------
     def disparity(self, rect_ref, rect_aux) -> np.ndarray:

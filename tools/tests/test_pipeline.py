@@ -100,25 +100,46 @@ def test_refine_detects_reversed_baseline():
     assert region_error(depth, truth_rect, 0.4, 0.6) < 0.08
 
 
-def test_refine_survives_grossly_wrong_calibration():
+def test_self_calibration_on_placeholder_phone_calibration():
+    """A phone that reports nominal values: lenses "parallel", baseline in the wrong
+    direction, while really the second camera points a few degrees off, is rolled,
+    and sits mostly below the first one."""
     import cv2
-    from mcdepth.pipeline import Camera
 
-    true_rig = synth.phone_rig()
-    ref, aux, truth = synth.render_pair(true_rig)
-    k = true_rig.aux.k.copy()
-    k[0, 0] *= 1.12  # focal length 12 % off
-    k[1, 1] *= 1.12
-    k[0, 2] += 25  # principal point 25 px off
-    k[1, 2] -= 18
-    err, _ = cv2.Rodrigues(np.deg2rad([0.0, 0.0, 3.0]))  # and rotated 3 degrees
-    bad = StereoRig(true_rig.ref, Camera(1280, 960, k), err @ true_rig.r, err @ true_rig.t)
-    sd = StereoDepth(bad, out_size=(640, 480))
+    rvec = np.deg2rad([1.5, -3.0, 2.5])
+    r_true, _ = cv2.Rodrigues(rvec)
+    c2_true = np.array([0.004, 0.018, 0.0])
+    base = synth.phone_rig()
+    true_rig = StereoRig(base.ref, base.aux, r_true, -r_true @ c2_true)
+    ref, aux, truth = synth.render_pair(true_rig, near=0.35, far=0.9)
+
+    reported = StereoRig(base.ref, base.aux, np.eye(3), -np.array([0.018, 0.010, 0.0]))
+    sd = StereoDepth(reported, out_size=(640, 480))
     _, _, _, before = sd.compute(ref, aux)
     info = sd.refine(ref, aux)
-    assert info["applied"] and info.get("coarse") and sd.self_calibrated
+    assert info["applied"] and info["self_calibrated"] and info["direction_measured"], info
+    u = np.array(info["baseline_direction"])
+    true_dir = c2_true[:2] / np.linalg.norm(c2_true[:2])
+    assert np.degrees(np.arccos(np.clip(u @ true_dir, -1, 1))) < 8
     depth, truth_rect = _depth_ok(sd, ref, aux, truth)
-    assert np.isfinite(depth).mean() > max(0.5, np.isfinite(before).mean() + 0.2)
-    near = np.nanmedian(depth[(truth_rect > 0.4) & (truth_rect < 0.6)])
-    far = np.nanmedian(depth[(truth_rect > 1.3) & (truth_rect < 1.7)])
+    assert np.isfinite(depth).mean() > max(0.4, np.isfinite(before).mean() + 0.2)
+    near = np.nanmedian(depth[(truth_rect > 0.3) & (truth_rect < 0.4)])
+    far = np.nanmedian(depth[(truth_rect > 0.8) & (truth_rect < 1.0)])
     assert near < far  # relative depth: ordering is right even though scale is not
+
+
+def test_orientation_rotation_matches_a_portrait_back_camera():
+    r = geometry.orientation_rotation(90)
+    np.testing.assert_allclose(r, [[0, -1, 0], [-1, 0, 0], [0, 0, -1]], atol=1e-12)
+    np.testing.assert_allclose(np.linalg.det(r), 1.0)
+    np.testing.assert_allclose(np.linalg.det(geometry.orientation_rotation(270, front_facing=True)), 1.0)
+
+
+def test_parallax_direction_ignores_stray_matches():
+    rng = np.random.default_rng(5)
+    u = np.array([np.cos(1.1), np.sin(1.1)])
+    good = np.outer(rng.uniform(-40, 40, 80), u) + rng.normal(0, 0.3, (80, 2))
+    stray = rng.uniform(-60, 60, (25, 2))
+    d, n = geometry.parallax_direction(np.vstack([good, stray]))
+    assert d is not None and n > 60 and abs(d @ u) > 0.995
+    assert geometry.parallax_direction(rng.uniform(-60, 60, (100, 2)))[0] is None

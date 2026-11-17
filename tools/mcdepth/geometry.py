@@ -171,3 +171,116 @@ def fit_row_alignment(p1, p2, vertical, center, iters=300, thresh=1.0, seed=7):
     else:
         h = np.array([[1, 0, 0], [a, b, c_abs], [0, 0, 1.0]])
     return h, int(best.sum())
+
+
+def orientation_rotation(sensor_orientation: int, front_facing: bool = False) -> np.ndarray:
+    """Device ("sensor") coordinates -> camera coordinates, derived from
+    SENSOR_ORIENTATION alone. Used when a phone publishes a placeholder
+    LENS_POSE_ROTATION that does not match how its images are oriented.
+
+    Device axes: x right, y up, z out of the screen. Rotating the image
+    clockwise by sensor_orientation makes it upright.
+    """
+    a = np.deg2rad(sensor_orientation)
+    right = np.array([-1.0 if front_facing else 1.0, 0.0, 0.0])  # scene-right in device axes
+    down = np.array([0.0, -1.0, 0.0])
+    forward = np.array([0.0, 0.0, 1.0 if front_facing else -1.0])
+    x = np.cos(a) * right + np.sin(a) * down
+    y = -np.sin(a) * right + np.cos(a) * down
+    return np.stack([x, y, forward])
+
+
+def parallax_direction(residuals, min_len=4.0, max_len=200.0, tol=1.5, max_candidates=200):
+    """Direction along which matched points are displaced by depth.
+
+    After the two images are aligned on the dominant surface, every remaining
+    displacement between matched points is parallax, which runs along the
+    baseline. residuals: (N,2) displacement vectors. Returns (unit vector, inliers)
+    or (None, inliers) when there is no clear common direction.
+    """
+    r = np.asarray(residuals, float).reshape(-1, 2)
+    length = np.hypot(r[:, 0], r[:, 1])
+    r = r[(length > min_len) & (length < max_len)]
+    n = len(r)
+    if n < 12:
+        return None, n
+    step = max(1, n // max_candidates)
+    best, best_count = None, 0
+    for cand in r[::step]:
+        u = cand / np.hypot(cand[0], cand[1])
+        inl = np.abs(r[:, 0] * u[1] - r[:, 1] * u[0]) < tol
+        if inl.sum() > best_count:
+            best_count, best = int(inl.sum()), inl
+    if best_count < 12 or best_count < 0.5 * n:
+        return None, best_count
+    pts = r[best]
+    scatter = pts.T @ pts
+    w, v = np.linalg.eigh(scatter)
+    return v[:, 1], best_count
+
+
+def rotation_from_similarity(m, f, cx, cy):
+    """Camera rotation that explains a measured image-to-image similarity.
+
+    m: 2x3 similarity taking aux pixels onto ref pixels (both at focal f,
+    principal point cx, cy). Returns (R, scale): R rotates aux rays into the
+    ref frame, so  K R diag(scale, scale, 1) K^-1  equals m near the image
+    centre but, unlike m, is also right towards the edges.
+    """
+    m = np.asarray(m, float)
+    scale = float(np.hypot(m[0, 0], m[1, 0]))
+    roll = np.arctan2(m[1, 0], m[0, 0])
+    qx = m[0, 0] * cx + m[0, 1] * cy + m[0, 2]
+    qy = m[1, 0] * cx + m[1, 1] * cy + m[1, 2]
+    v = np.array([(qx - cx) / f, (qy - cy) / f, 1.0])
+    v /= np.linalg.norm(v)
+    axis = np.array([-v[1], v[0], 0.0])  # z cross v
+    sin = float(np.linalg.norm(axis))
+    point = np.eye(3)
+    if sin > 1e-12:
+        k = axis / sin
+        kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        point = np.eye(3) + sin * kx + (1 - v[2]) * (kx @ kx)
+    c, s_ = np.cos(roll), np.sin(roll)
+    rz = np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1.0]])
+    return point @ rz, scale
+
+
+def rodrigues(w) -> np.ndarray:
+    """Rotation vector (axis * angle, radians) -> rotation matrix."""
+    w = np.asarray(w, float)
+    angle = float(np.linalg.norm(w))
+    if angle < 1e-12:
+        return np.eye(3)
+    k = w / angle
+    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(angle) * kx + (1 - np.cos(angle)) * (kx @ kx)
+
+
+def refine_rotation(r, rays_aux, target, mask, tol, iters=3):
+    """Least-squares polish of a rotation that takes aux rays onto ref points.
+
+    rays_aux: (N,3) rays in the aux frame. target: (N,2) normalised ref image
+    coordinates of the same points. mask: which pairs to trust in the first
+    round; later rounds use every pair that agrees within tol.
+    Returns (rotation, number of agreeing pairs).
+    """
+    r = np.asarray(r, float)
+    mask = np.asarray(mask, bool)
+    for i in range(iters):
+        q = rays_aux @ r.T
+        xy = q[:, :2] / q[:, 2:]
+        if i > 0:
+            mask = np.hypot(*(target - xy).T) < tol
+        if mask.sum() < 12:
+            break
+        x, y = xy[mask, 0], xy[mask, 1]
+        # effect of a small extra rotation w on the projected point
+        jx = np.stack([-x * y, 1 + x * x, -y], axis=1)
+        jy = np.stack([-(1 + y * y), x * y, x], axis=1)
+        d = (target - xy)[mask]
+        w, *_ = np.linalg.lstsq(np.vstack([jx, jy]), np.r_[d[:, 0], d[:, 1]], rcond=None)
+        r = rodrigues(w) @ r
+    q = rays_aux @ r.T
+    agree = np.hypot(*(target - q[:, :2] / q[:, 2:]).T) < tol
+    return r, int(agree.sum())
