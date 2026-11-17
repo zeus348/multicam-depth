@@ -249,6 +249,7 @@ class MainActivity : Activity() {
                 val center = if (r.centerDepth.isNaN()) "no reading" else "%.2f %s".format(r.centerDepth, unit)
                 val rec = recorder?.let { "  REC ${it.written.get()} pairs, ${it.skipped.get()} skipped" } ?: ""
                 val line = "centre: $center   ${(r.validFraction * 100).toInt()}% valid   ${r.millis} ms\n" +
+                    "colours: red %.2f to blue %.2f $unit\n".format(r.nearest, r.farthest) +
                     "left: ${mode.label} (tap image to switch)\n$alignNote\nskew ${(ref.timestampNs - aux.timestampNs) / 1000} us$rec"
                 runOnUiThread {
                     refView.setImageBitmap(r.reference)

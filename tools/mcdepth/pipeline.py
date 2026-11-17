@@ -50,7 +50,7 @@ class StereoDepth:
         self.aux_k = aux_k
         self.rect = geometry.rectify(r, t)
         along = self.out_h if self.rect.vertical else self.out_w
-        nd = self.max_disparity or along // 5
+        nd = self.max_disparity or along // 8
         self.num_disparities = max(16, int(np.ceil(nd / 16)) * 16)
         self._build_maps()
 
@@ -62,6 +62,15 @@ class StereoDepth:
         self.map_aux = cv2.initUndistortRectifyMap(
             self.aux_k, rig.aux.dist, self.rect.r2, self.correction @ self.k_new, size, cv2.CV_16SC2
         )
+        # which rectified pixels actually come from inside each camera's image
+        self.valid_ref = self._coverage(rig.ref, self.map_ref)
+        self.valid_aux = self._coverage(rig.aux, self.map_aux)
+
+    @staticmethod
+    def _coverage(cam, maps):
+        full = np.full((cam.height, cam.width), 255, np.uint8)
+        mask = cv2.remap(full, *maps, cv2.INTER_NEAREST)
+        return cv2.erode(mask, np.ones((5, 5), np.uint8))
 
     def rectify(self, img_ref, img_aux):
         a = cv2.remap(img_ref, *self.map_ref, cv2.INTER_LINEAR)
@@ -215,16 +224,20 @@ class StereoDepth:
     def disparity(self, rect_ref, rect_aux) -> np.ndarray:
         """Disparity (pixels, > 0) for every pixel of the rectified reference
         image, NaN where no match was found."""
-        left, right = _gray(rect_ref), _gray(rect_aux)
+        # bring everything into the form the matcher expects: horizontal baseline,
+        # reference camera on the left
+        mats = [_gray(rect_ref), _gray(rect_aux), self.valid_ref, self.valid_aux]
         if self.rect.vertical:
-            left, right = cv2.transpose(left), cv2.transpose(right)
+            mats = [cv2.transpose(m) for m in mats]
         flipped = self.rect.baseline * self.baseline_sign < 0  # reference camera is the right-hand one
         if flipped:
-            left, right = cv2.flip(left, 1), cv2.flip(right, 1)
+            mats = [cv2.flip(m, 1) for m in mats]
+        left, right, valid_left, valid_right = mats
+        nd = self.num_disparities
         block = 5
         sgbm = cv2.StereoSGBM_create(
             minDisparity=0,
-            numDisparities=self.num_disparities,
+            numDisparities=nd,
             blockSize=block,
             P1=8 * block * block,
             P2=32 * block * block,
@@ -234,7 +247,18 @@ class StereoDepth:
             speckleRange=2,
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
-        disp = sgbm.compute(left, right).astype(np.float32) / 16.0
+
+        # The matcher cannot fill the first `nd` columns; padding moves that blind strip
+        # off the image.
+        def pad(m):
+            return cv2.copyMakeBorder(m, 0, 0, nd, 0, cv2.BORDER_CONSTANT, value=0)
+
+        disp = sgbm.compute(pad(left), pad(right))[:, nd:].astype(np.float32) / 16.0
+        # drop pixels outside the reference image and matches that land outside the second one
+        h, w = disp.shape
+        xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        landed = cv2.remap(valid_right, xs - np.maximum(disp, 0), ys, cv2.INTER_NEAREST)
+        disp[(landed == 0) | (valid_left == 0)] = -1
         if flipped:
             disp = cv2.flip(disp, 1)
         if self.rect.vertical:
@@ -270,11 +294,23 @@ def match_features(a, b, max_features=2000):
     return p1, p2
 
 
-def colorize(disp: np.ndarray, max_disparity: float) -> np.ndarray:
-    """Near = warm, far = cool, no data = black."""
+def display_range(disp: np.ndarray):
+    """Disparity range that covers the scene (2nd to 98th percentile), for colouring."""
+    valid = disp[np.isfinite(disp)]
+    if valid.size < 100:
+        return 0.0, 1.0
+    lo, hi = np.percentile(valid, [2, 98])
+    return float(lo), float(max(hi, lo + 1.0))
+
+
+def colorize(disp: np.ndarray, lo: float | None = None, hi: float | None = None) -> np.ndarray:
+    """Near = warm, far = cool, no data = black. The colour range follows the scene
+    unless lo and hi (disparities) are given."""
+    if lo is None or hi is None:
+        lo, hi = display_range(disp)
     valid = np.isfinite(disp)
     norm = np.zeros(disp.shape, np.uint8)
-    norm[valid] = np.clip(disp[valid] / max_disparity * 255, 0, 255).astype(np.uint8)
+    norm[valid] = np.clip((disp[valid] - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
     color = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
     color[~valid] = 0
     return color

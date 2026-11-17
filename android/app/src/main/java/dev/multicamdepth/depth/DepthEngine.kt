@@ -42,6 +42,9 @@ class DepthResult(
     /** median depth of the centre patch (metres if the rig is metric), NaN if unknown */
     val centerDepth: Double,
     val validFraction: Double,
+    /** depths shown as the warmest and the coolest colour */
+    val nearest: Double,
+    val farthest: Double,
     val millis: Long,
 )
 
@@ -88,6 +91,12 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private val auxMap2 = Mat()
     private val rectRef = Mat()
     private val rectAux = Mat()
+    private val validRef = Mat()
+    private val validAux = Mat()
+    private var gridX = Mat()
+    private var gridY = Mat()
+    private var rangeLo = Double.NaN // colour range in disparity * 16, smoothed over time
+    private var rangeHi = Double.NaN
     private var previous: Mat? = null // last disparity, for temporal smoothing
 
     init {
@@ -105,7 +114,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private fun setGeometry(r: DoubleArray, t: DoubleArray, auxCameraMatrix: DoubleArray) {
         auxK = auxCameraMatrix
         rect = StereoGeometry.rectify(r, t)
-        val n = maxOf(16, ceil((if (rect.vertical) outH else outW) / 5.0 / 16).toInt() * 16)
+        val n = maxOf(16, ceil((if (rect.vertical) outH else outW) / 8.0 / 16).toInt() * 16)
         if (n != numDisparities || sgbm == null) {
             numDisparities = n
             sgbm = StereoSGBM.create(
@@ -119,8 +128,12 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private fun buildMaps() {
         buildMap(refK, rig.ref.dist, rect.r1, kNew, refMap1, refMap2)
         buildMap(auxK, rig.aux.dist, rect.r2, Mat3.mul(correction, kNew), auxMap1, auxMap2)
+        coverage(rig.ref.width, rig.ref.height, refMap1, refMap2, validRef)
+        coverage(rig.aux.width, rig.aux.height, auxMap1, auxMap2, validAux)
         previous?.release()
         previous = null
+        rangeLo = Double.NaN
+        rangeHi = Double.NaN
     }
 
     private fun buildMap(k: DoubleArray, dist: DoubleArray, r: DoubleArray, newK: DoubleArray, map1: Mat, map2: Mat) {
@@ -130,6 +143,16 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         val dm = MatOfDouble(*dist)
         Calib3d.initUndistortRectifyMap(km, dm, rm, nm, size, CvType.CV_16SC2, map1, map2)
         listOf(km, rm, nm, dm).forEach { it.release() }
+    }
+
+    /** Which rectified pixels actually come from inside a camera's image. */
+    private fun coverage(width: Int, height: Int, map1: Mat, map2: Mat, out: Mat) {
+        val full = Mat(height, width, CvType.CV_8UC1, Scalar(255.0))
+        val kernel = Mat.ones(5, 5, CvType.CV_8UC1)
+        Imgproc.remap(full, out, map1, map2, Imgproc.INTER_NEAREST)
+        Imgproc.erode(out, out, kernel)
+        full.release()
+        kernel.release()
     }
 
     private fun rectify(ref: Frame, aux: Frame) {
@@ -365,22 +388,57 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         val start = System.nanoTime()
         rectify(ref, aux)
 
-        // bring the pair into the form the matcher expects: horizontal baseline, reference on the left
-        var left = rectRef
-        var right = rectAux
+        // bring everything into the form the matcher expects: horizontal baseline,
+        // reference camera on the left
         val temps = ArrayList<Mat>()
-        fun both(op: (Mat, Mat) -> Unit) {
-            val l = Mat().also { op(left, it) }
-            val r = Mat().also { op(right, it) }
-            temps += l; temps += r
-            left = l; right = r
-        }
-        if (rect.vertical) both { s, d -> Core.transpose(s, d) }
         val flipped = rect.baseline * baselineSign < 0
-        if (flipped) both { s, d -> Core.flip(s, d, 1) }
+        fun canonical(src: Mat): Mat {
+            var m = src
+            if (rect.vertical) m = Mat().also { Core.transpose(m, it); temps += it }
+            if (flipped) m = Mat().also { Core.flip(m, it, 1); temps += it }
+            return m
+        }
+        val left = canonical(rectRef)
+        val right = canonical(rectAux)
+        val validLeft = canonical(validRef)
+        val validRight = canonical(validAux)
 
-        val disp = Mat() // CV_16S, disparity * 16
-        sgbm!!.compute(left, right, disp)
+        // The matcher cannot fill the first numDisparities columns; padding moves that
+        // blind strip off the image.
+        val nd = numDisparities
+        fun padded(m: Mat) = Mat().also {
+            Core.copyMakeBorder(m, it, 0, 0, nd, 0, Core.BORDER_CONSTANT, Scalar(0.0))
+            temps += it
+        }
+        val wide = Mat().also { temps += it }
+        sgbm!!.compute(padded(left), padded(right), wide)
+        val disp = wide.submat(0, left.rows(), nd, nd + left.cols()).clone() // CV_16S, disparity * 16
+
+        // drop pixels outside the reference image and matches that land outside the second one
+        if (gridX.rows() != disp.rows() || gridX.cols() != disp.cols()) {
+            val w = disp.cols()
+            val h = disp.rows()
+            gridX = Mat(h, w, CvType.CV_32F)
+            gridY = Mat(h, w, CvType.CV_32F)
+            val xs = FloatArray(w) { it.toFloat() }
+            for (y in 0 until h) {
+                gridX.put(y, 0, xs)
+                gridY.put(y, 0, FloatArray(w) { y.toFloat() })
+            }
+        }
+        val shift = Mat().also { temps += it }
+        disp.convertTo(shift, CvType.CV_32F, 1 / 16.0)
+        Core.max(shift, Scalar(0.0), shift)
+        Core.subtract(gridX, shift, shift)
+        val landed = Mat().also { temps += it }
+        Imgproc.remap(validRight, landed, shift, gridY, Imgproc.INTER_NEAREST)
+        val bad = Mat().also { temps += it }
+        val outside = Mat().also { temps += it }
+        Core.compare(landed, Scalar(0.0), bad, Core.CMP_EQ)
+        Core.compare(validLeft, Scalar(0.0), outside, Core.CMP_EQ)
+        Core.bitwise_or(bad, outside, bad)
+        disp.setTo(Scalar(-16.0), bad)
+
         if (flipped) Core.flip(disp, disp, 1)
         if (rect.vertical) {
             val t = Mat()
@@ -410,8 +468,21 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         }
 
         // colour: near = warm, far = cool, unknown = black
+        // The colour range follows the scene (2nd to 98th percentile of disparity), eased
+        // over time so it does not pump.
+        val all = ShortArray(outW * outH)
+        disp.get(0, 0, all)
+        val sample = (all.indices step 7).map { all[it] }.filter { it > 0 }.sorted()
+        if (sample.size >= 100) {
+            val lo = sample[(sample.size * 0.02).toInt()].toDouble()
+            val hi = maxOf(sample[(sample.size * 0.98).toInt()].toDouble(), lo + 16.0)
+            rangeLo = if (rangeLo.isNaN()) lo else rangeLo * RANGE_KEEP + lo * (1 - RANGE_KEEP)
+            rangeHi = if (rangeHi.isNaN()) hi else rangeHi * RANGE_KEEP + hi * (1 - RANGE_KEEP)
+        }
+        val lo = if (rangeLo.isNaN()) 0.0 else rangeLo
+        val hi = if (rangeHi.isNaN()) numDisparities * 16.0 else rangeHi
         val disp8 = Mat()
-        disp.convertTo(disp8, CvType.CV_8U, 255.0 / (numDisparities * 16.0))
+        disp.convertTo(disp8, CvType.CV_8U, 255.0 / (hi - lo), -lo * 255.0 / (hi - lo))
         val color = Mat()
         Imgproc.applyColorMap(disp8, color, Imgproc.COLORMAP_TURBO)
         Imgproc.cvtColor(color, color, Imgproc.COLOR_BGR2RGBA)
@@ -435,6 +506,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         )
         val result = DepthResult(
             toBitmap(refRgba), toBitmap(color), centerDepth, validFraction,
+            focal * abs(rect.baseline) * 16.0 / hi, focal * abs(rect.baseline) * 16.0 / maxOf(lo, 1.0),
             (System.nanoTime() - start) / 1_000_000,
         )
         listOf(disp, valid, disp8, color, refRgba).forEach { it.release() }
@@ -479,6 +551,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
 
     private companion object {
         const val BLOCK = 5
+        const val RANGE_KEEP = 0.85 // weight of the previous colour range
         const val SMOOTH_KEEP = 0.6 // weight of the previous frame
         const val SMOOTH_MAX_JUMP = 1.5 // pixels of disparity; larger changes are taken as real
     }

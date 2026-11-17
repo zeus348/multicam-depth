@@ -44,7 +44,7 @@ def process(args):
         stem = Path(row["ref_file"]).stem
         mm = np.where(np.isfinite(depth), np.clip(depth * 1000, 0, 65535), 0).astype(np.uint16)
         cv2.imwrite(str(out / f"{stem}_depth_mm.png"), mm)
-        cv2.imwrite(str(out / f"{stem}_vis.jpg"), np.hstack([rect_ref, colorize(disp, sd.num_disparities)]))
+        cv2.imwrite(str(out / f"{stem}_vis.jpg"), np.hstack([rect_ref, colorize(disp)]))
         if args.ply:
             write_ply(out / f"{stem}.ply", depth, rect_ref, sd.k_new)
         valid = np.isfinite(depth)
