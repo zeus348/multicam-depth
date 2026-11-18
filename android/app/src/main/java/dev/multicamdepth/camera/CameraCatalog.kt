@@ -20,6 +20,8 @@ class CameraPair(
     val timestampSource: Int?,
     /** fastest fixed frame rate the camera offers (up to 30): keeps exposures short in dim light */
     val fixedFps: Int?,
+    /** the phone accepts a stabiliser setting for each lens separately */
+    val perLensStabiliser: Boolean,
     val canDisableDistortionCorrection: Boolean,
     val hasDistortionCorrection: Boolean,
     val ref: PhysicalCamera,
@@ -65,6 +67,8 @@ object CameraCatalog {
                 sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
                 syncType = chars.get(CameraCharacteristics.LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE),
                 timestampSource = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
+                perLensStabiliser = chars.availablePhysicalCameraRequestKeys
+                    ?.contains(android.hardware.camera2.CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE) == true,
                 fixedFps = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
                     ?.filter { it.lower == it.upper && it.upper <= 30 }?.maxOfOrNull { it.upper },
                 canDisableDistortionCorrection =

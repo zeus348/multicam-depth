@@ -109,6 +109,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         private set
     var trackedBlocks = 0
         private set
+    private var lastShift: StereoGeometry.RowShift? = null
     private var previous: Mat? = null // last disparity, for temporal smoothing
 
     init {
@@ -148,6 +149,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         rangeHi = Double.NaN
         fuseSlope = Double.NaN
         fuseOffset = Double.NaN
+        lastShift = null
     }
 
     private fun buildMap(k: DoubleArray, dist: DoubleArray, r: DoubleArray, newK: DoubleArray, map1: Mat, map2: Mat) {
@@ -485,10 +487,22 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             Core.reduce(band, column, 1, Core.REDUCE_AVG, CvType.CV_32F)
             FloatArray(h).also { column.get(0, 0, it) }.also { column.release(); band.release() }
         }
-        val shift = StereoGeometry.rowShiftPlane(profiles(left), profiles(right), w, maxOf(4, h / 40))
+        val measured = StereoGeometry.rowShiftPlane(profiles(left), profiles(right), w, maxOf(4, h / 40))
+        trackedBlocks = measured.blocks
+        // The lens drifts smoothly, the measurement is noisy: follow small changes gently and
+        // large ones at once, and if this frame gave no measurement keep the last one, since
+        // the lens is most likely still where it was.
+        val last = lastShift
+        val shift = when {
+            measured.blocks == 0 -> last ?: measured
+            last != null && abs(measured.a - last.a) < TRACK_JUMP -> StereoGeometry.RowShift(
+                (measured.a + last.a) / 2, (measured.b + last.b) / 2, (measured.c + last.c) / 2, measured.blocks,
+            )
+            else -> measured
+        }
+        lastShift = shift
         trackedShift = shift.a
-        trackedBlocks = shift.blocks
-        if (shift.blocks == 0 || (abs(shift.a) < 0.15 && abs(shift.b) * w < 0.3 && abs(shift.c) * h < 0.3)) return right
+        if (abs(shift.a) < 0.15 && abs(shift.b) * w < 0.3 && abs(shift.c) * h < 0.3) return right
         val m = Mat(2, 3, CvType.CV_64F).apply { put(0, 0, 1.0, 0.0, 0.0, shift.b, 1.0 + shift.c, shift.a) }
         val out = Mat().also { temps += it }
         Imgproc.warpAffine(right, out, m, Size(w.toDouble(), h.toDouble()), Imgproc.INTER_LINEAR or Imgproc.WARP_INVERSE_MAP)
@@ -591,6 +605,15 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             Core.bitwise_and(agree, both, agree)
             Core.compare(diff, Scalar(FUSE_CONFLICT), conflict, Core.CMP_GT)
             Core.bitwise_and(conflict, both, conflict)
+            // If the other pair disagrees over much of the overlap it is the one that is off
+            // this frame (its lens moved, or it mismatched): using it would punch holes.
+            val overlap = Core.countNonZero(both)
+            val agreeing = Core.countNonZero(agree)
+            if (overlap < FUSE_MIN_OVERLAP || agreeing < FUSE_MIN_AGREE * overlap) {
+                return "third camera: ignored this frame (%d%% of %d px agree)".format(
+                    if (overlap > 0) 100 * agreeing / overlap else 0, overlap,
+                )
+            }
             val onlyB = mat()
             Core.bitwise_not(va, onlyB)
             Core.bitwise_and(onlyB, vb, onlyB)
@@ -736,6 +759,9 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private companion object {
         const val BLOCK = 5
         const val TRACK_BANDS = 3
+        const val TRACK_JUMP = 1.0 // pixels; smaller frame-to-frame changes are averaged
+        const val FUSE_MIN_AGREE = 0.75 // share of the overlap that must agree to trust the third camera
+        const val FUSE_MIN_OVERLAP = 500
         const val STREAK_REACH = 5 // rows; taller gaps are treated as real holes
         const val RANGE_KEEP = 0.85 // weight of the previous colour range
         const val FUSE_KEEP = 0.8 // weight of the previous relation between the two pairs

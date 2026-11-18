@@ -46,6 +46,8 @@ to fix things on first run; the info panel in the app prints what the phone repo
    differ, and stabilisation or autofocus shifts one lens but not the other. Row-mean
    profiles, which do not depend on depth, are compared over a 3x3 grid of blocks and
    the fitted shift is removed before matching.
+   Autofocus is locked once the cameras are aligned, because a refocusing lens shifts
+   and rescales its image; Re-align refocuses first.
 6. **Match.** OpenCV semi-global block matching gives disparity `d`; depth is
    `focal_px * baseline / d`. A 5x5 median removes thin streaks.
 7. **Third camera.** With three cameras the middle lens is the reference and forms a

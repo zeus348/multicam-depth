@@ -41,6 +41,31 @@ class MultiCameraController(
     private var device: CameraDevice? = null
     private var readers: List<ImageReader> = emptyList()
     private var delivered = 0L
+    private var activeSession: CameraCaptureSession? = null
+    private var activeRequest: CaptureRequest.Builder? = null
+
+    /**
+     * Freezes the lenses where they are. Autofocus keeps nudging a lens, which shifts and
+     * rescales its image by several pixels and so undoes the alignment between the cameras.
+     */
+    fun lockFocus() = focusTrigger(CameraMetadata.CONTROL_AF_TRIGGER_START)
+
+    /** Lets autofocus run again, e.g. before re-aligning on a scene at a different distance. */
+    fun unlockFocus() = focusTrigger(CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+
+    private fun focusTrigger(trigger: Int) {
+        handler.post {
+            val session = activeSession ?: return@post
+            val request = activeRequest ?: return@post
+            try {
+                request.set(CaptureRequest.CONTROL_AF_TRIGGER, trigger)
+                session.capture(request.build(), null, handler)
+                request.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            } catch (e: Exception) {
+                // session already closed or replaced: nothing to lock
+            }
+        }
+    }
 
     /** how many cameras are actually streaming */
     @Volatile var activeCameras = 0
@@ -69,6 +94,7 @@ class MultiCameraController(
 
     fun close() {
         handler.post {
+            activeSession = null
             device?.close()
             device = null
             readers.forEach { it.close() }
@@ -78,6 +104,8 @@ class MultiCameraController(
     }
 
     private fun startSession(camera: CameraDevice, cameras: Int) {
+        activeSession = null
+        activeRequest = null
         val old = readers // still in use by the session being replaced; closed once the new one runs
         val ids = listOfNotNull(pair.ref.id, pair.aux.id, pair.aux2?.id).take(cameras)
         val groups = FrameSync<Frame>(cameras, PAIR_TOLERANCE_NS) { it.timestampNs }
@@ -100,7 +128,22 @@ class MultiCameraController(
             override fun onConfigured(session: CameraCaptureSession) {
                 old.forEach { it.close() }
                 try {
-                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    // settings for individual lenses need a request created with their ids
+                    val base = try {
+                        check(pair.perLensStabiliser)
+                        camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, ids.toSet()).also { b ->
+                            ids.forEach {
+                                b.setPhysicalCameraKey(
+                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF, it,
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // not offered, or refused: the whole-camera setting below still applies
+                        camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    }
+                    val request = base.apply {
                         created.forEach { addTarget(it.surface) }
                         // anything that moves the lens or warps the image breaks the calibration
                         set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
@@ -112,6 +155,8 @@ class MultiCameraController(
                         }
                     }
                     session.setRepeatingRequest(request.build(), null, handler)
+                    activeSession = session
+                    activeRequest = request
                     activeCameras = cameras
                     if (cameras == 3) {
                         // some phones accept the session but never deliver all three streams

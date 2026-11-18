@@ -188,6 +188,10 @@ def test_third_camera_fills_holes_and_removes_false_matches():
     expect = wide.ref.k[0, 0] / 2 * 0.01503 / 0.45  # true disparity of the near square
     assert np.nanmedian(fused[200:240, 280:340]) == pytest.approx(expect, abs=0.6)
     assert np.isnan(fused[250:270, 300:360]).mean() > 0.8
+    # a second pair that mostly disagrees is ignored rather than allowed to punch holes
+    scrambled = moved + np.where(np.arange(640)[None, :] % 2 == 0, 9.0, 0.0)
+    kept, why = fuse_disparities(disp_a, scrambled)
+    assert not why["fused"] and kept is disp_a
     # and it must not make the untouched part worse
     untouched = np.isfinite(disp_a) & np.isfinite(fused)
     assert np.nanmedian(np.abs(fused - disp_a)[untouched]) < 0.25

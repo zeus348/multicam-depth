@@ -40,6 +40,7 @@ import kotlin.math.abs
 class MainActivity : Activity() {
     private companion object {
         const val ALIGN_RETRY_FRAMES = 10
+        const val REFOCUS_FRAMES = 12 // processed frames to let autofocus settle before aligning
         const val STEADY_RAD_S = 0.3 // slower than this the phone counts as held still
         const val KEEP_STEADY = 0.6 // weight of the previous depth frame
         const val KEEP_MOVING = 0.3 // the gyroscope only knows rotation, so while moving lean on the new frame
@@ -78,6 +79,8 @@ class MainActivity : Activity() {
     private var deviceToCamera = dev.multicamdepth.calib.Mat3.identity
     private var clocksShared = false
     private var frameCount = 0
+    private var refocusLeft = REFOCUS_FRAMES
+    private var focusLocked = false
 
     @Volatile private var alignRequested = true
     @Volatile private var recorder: SessionRecorder? = null
@@ -97,7 +100,14 @@ class MainActivity : Activity() {
         baselineButton = findViewById(R.id.baselineButton)
 
         recordButton.setOnClickListener { toggleRecording() }
-        findViewById<Button>(R.id.alignButton).setOnClickListener { alignRequested = true }
+        findViewById<Button>(R.id.alignButton).setOnClickListener {
+            controller?.unlockFocus()
+            depthHandler.post {
+                focusLocked = false
+                refocusLeft = REFOCUS_FRAMES
+                alignRequested = true
+            }
+        }
         findViewById<Button>(R.id.shareButton).setOnClickListener { shareLast() }
         distortionButton = findViewById(R.id.distortionButton)
         distortionButton.setOnClickListener {
@@ -210,6 +220,8 @@ class MainActivity : Activity() {
                 }
             }
             alignRequested = true
+            refocusLeft = REFOCUS_FRAMES
+            focusLocked = false
             alignNote = ""
             alignNote2 = ""
             lastFrameNs = 0
@@ -282,11 +294,19 @@ class MainActivity : Activity() {
                 // until it is held still and keep trying until it works.
                 frameCount++
                 val retry = frameCount % ALIGN_RETRY_FRAMES == 0
-                if (steady) {
+                if (alignRequested && refocusLeft > 0) {
+                    refocusLeft-- // autofocus is settling on the scene
+                    alignNote = "focusing..."
+                } else if (steady) {
                     val all = alignRequested
                     alignRequested = false
                     if (all || (!e.aligned && retry)) alignNote = e.refine(ref, aux)
                     if (e2 != null && aux2 != null && (all || (!e2.aligned && retry))) alignNote2 = e2.refine(ref, aux2)
+                    // Aligned at this focus setting: freeze the lenses so it stays valid.
+                    if (e.aligned && !focusLocked) {
+                        controller?.lockFocus()
+                        focusLocked = true
+                    }
                 } else if (alignRequested) {
                     alignNote = "hold the phone still to align"
                 }
@@ -318,6 +338,7 @@ class MainActivity : Activity() {
                     "left: ${mode.label} (tap image to switch)\n$alignNote\n" +
                     (if (fusion.isNotEmpty()) "$fusion\n" else "") +
                     (if (notice.isNotEmpty()) "$notice\n" else "") +
+                    (if (focusLocked) "focus locked (Re-align refocuses)\n" else "") +
                     "row tracking: %+.1f px (%d of 9 blocks)\n".format(e.trackedShift, e.trackedBlocks) +
                     "$motionNote$rec"
                 runOnUiThread {

@@ -336,7 +336,7 @@ def warp_disparity(disp, src: "StereoDepth", dst: "StereoDepth") -> np.ndarray:
     return out
 
 
-def fuse_disparities(primary, secondary, agree_px=1.5, conflict_px=3.0):
+def fuse_disparities(primary, secondary, agree_px=1.5, conflict_px=3.0, min_agree=0.75):
     """Combine two disparity maps of the same view from different camera pairs.
 
     Both are affine in inverse depth, so they are related by  secondary = a*primary + b.
@@ -345,7 +345,9 @@ def fuse_disparities(primary, secondary, agree_px=1.5, conflict_px=3.0):
       both agree      -> average, weighted by how sensitive each pair is to depth
       clear conflict  -> dropped (at least one is a false match)
       only one valid  -> that one (the pairs see around different occlusions)
-    Returns (fused, info). If the line cannot be fitted the primary is returned unchanged.
+    Returns (fused, info). If the line cannot be fitted, or less than min_agree of the
+    overlap agrees (the secondary is then the unreliable one), the primary is returned
+    unchanged.
     """
     va, vb = np.isfinite(primary), np.isfinite(secondary)
     both = va & vb
@@ -358,6 +360,11 @@ def fuse_disparities(primary, secondary, agree_px=1.5, conflict_px=3.0):
     vb = np.isfinite(converted)
     both = va & vb
     diff = np.abs(primary - converted)
+    agree = both & (diff < agree_px)
+    if both.sum() < 500 or agree.sum() < min_agree * both.sum():
+        # the secondary is the one that is off this frame; using it would punch holes
+        info.update(agree=int(agree.sum()), overlap=int(both.sum()))
+        return primary, info
     w = a * a / (1 + a * a)  # weight of the secondary: its noise shrinks by a when converted
     out = primary.copy()
     agree = both & (diff < agree_px)
