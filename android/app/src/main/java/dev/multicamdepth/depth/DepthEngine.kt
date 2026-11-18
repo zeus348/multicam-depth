@@ -56,6 +56,10 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     val focal = StereoGeometry.rectifiedFocal(rig.ref, rig.aux, outW)
     private val cx = outW / 2.0
     private val cy = outH / 2.0
+
+    /** principal point of the rectified view */
+    val centerX get() = cx
+    val centerY get() = cy
     private val kNew = doubleArrayOf(focal, 0.0, cx, 0.0, focal, cy, 0.0, 0.0, 1.0)
     private val refK = rig.ref.k.let { doubleArrayOf(it.fx, 0.0, it.cx, 0.0, it.fy, it.cy, 0.0, 0.0, 1.0) }
     private val nominalAuxK = rig.aux.k.let { doubleArrayOf(it.fx, 0.0, it.cx, 0.0, it.fy, it.cy, 0.0, 0.0, 1.0) }
@@ -97,6 +101,8 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private var gridY = Mat()
     private var rangeLo = Double.NaN // colour range in disparity * 16, smoothed over time
     private var rangeHi = Double.NaN
+    private var fuseSlope = Double.NaN // other pair's disparity = slope * ours + offset, eased
+    private var fuseOffset = Double.NaN
     private var previous: Mat? = null // last disparity, for temporal smoothing
 
     init {
@@ -134,6 +140,8 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         previous = null
         rangeLo = Double.NaN
         rangeHi = Double.NaN
+        fuseSlope = Double.NaN
+        fuseOffset = Double.NaN
     }
 
     private fun buildMap(k: DoubleArray, dist: DoubleArray, r: DoubleArray, newK: DoubleArray, map1: Mat, map2: Mat) {
@@ -384,8 +392,12 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
 
     // ---- depth -----------------------------------------------------------------------
 
-    fun compute(ref: Frame, aux: Frame, view: View = View.REFERENCE): DepthResult {
-        val start = System.nanoTime()
+    /**
+     * Disparity of the reference view against this engine's second camera: CV_16S,
+     * disparity * 16, anything <= 0 means no reading. The caller owns the result and
+     * hands it to [finish] (or releases it).
+     */
+    fun match(ref: Frame, aux: Frame): Mat {
         rectify(ref, aux)
 
         // bring everything into the form the matcher expects: horizontal baseline,
@@ -448,7 +460,115 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             t.release()
         }
         temps.forEach { it.release() }
-        smooth(disp)
+        despeckle(disp)
+        return disp
+    }
+
+    /** 5x5 median over valid disparities: removes thin streaks and isolated wrong matches. */
+    private fun despeckle(disp: Mat) {
+        val clamped = Mat()
+        val median = Mat()
+        val bad = Mat()
+        val gone = Mat()
+        Core.max(disp, Scalar(0.0), clamped)
+        clamped.convertTo(clamped, CvType.CV_16U)
+        Imgproc.medianBlur(clamped, clamped, 5)
+        clamped.convertTo(median, CvType.CV_16S)
+        Core.compare(median, Scalar(0.0), bad, Core.CMP_LE)
+        Core.compare(disp, Scalar(0.0), gone, Core.CMP_LE)
+        Core.bitwise_or(bad, gone, bad)
+        median.setTo(Scalar(-16.0), bad)
+        median.copyTo(disp)
+        listOf(clamped, median, bad, gone).forEach { it.release() }
+    }
+
+    /**
+     * Folds a second pair's disparity ([otherDisp], from [other], which must share this
+     * engine's reference camera) into [disp]. Both are affine in inverse depth, so they are
+     * related by a line; it is fitted where both are valid and then, per pixel: agreeing
+     * values are averaged, clear conflicts dropped as false matches, and holes in one are
+     * filled from the other. Same logic as fuse_disparities in tools/mcdepth/pipeline.py.
+     * Returns a summary for the status display.
+     */
+    fun absorb(disp: Mat, otherDisp: Mat, other: DepthEngine): String {
+        // this view's pixel -> the other view's pixel: same camera centre, so a pure rotation
+        val kInv = doubleArrayOf(1 / focal, 0.0, -cx / focal, 0.0, 1 / focal, -cy / focal, 0.0, 0.0, 1.0)
+        val h = Mat3.mul(Mat3.mul(Mat3.mul(other.kNew, other.rect.r1), Mat3.transpose(rect.r1)), kInv)
+        val hm = mat3(h)
+        val moved = Mat()
+        Imgproc.warpPerspective(
+            otherDisp, moved, hm, size, Imgproc.INTER_NEAREST or Imgproc.WARP_INVERSE_MAP,
+            Core.BORDER_CONSTANT, Scalar(-16.0),
+        )
+        val a32 = Mat()
+        val b32 = Mat()
+        disp.convertTo(a32, CvType.CV_32F, 1 / 16.0)
+        moved.convertTo(b32, CvType.CV_32F, 1 / 16.0)
+        val temps = arrayListOf(hm, moved, a32, b32)
+        try {
+            val fa = FloatArray(outW * outH)
+            val fb = FloatArray(outW * outH)
+            a32.get(0, 0, fa)
+            b32.get(0, 0, fb)
+            val idx = (fa.indices step 7).filter { fa[it] > 0 && fb[it] > 0 }
+            val line = StereoGeometry.fitLine(FloatArray(idx.size) { fa[idx[it]] }, FloatArray(idx.size) { fb[idx[it]] })
+            if (line != null && line.slope > 0) {
+                // ease the relation over time so the fused picture does not breathe
+                fuseSlope = if (fuseSlope.isNaN()) line.slope else fuseSlope * FUSE_KEEP + line.slope * (1 - FUSE_KEEP)
+                fuseOffset = if (fuseOffset.isNaN()) line.offset else fuseOffset * FUSE_KEEP + line.offset * (1 - FUSE_KEEP)
+            }
+            if (fuseSlope.isNaN()) return "third camera: scene too flat or no overlap to relate it yet"
+            val slope = fuseSlope
+            fun mat() = Mat().also { temps += it }
+            val conv = mat()
+            b32.convertTo(conv, CvType.CV_32F, 1 / slope, -fuseOffset / slope)
+            val va = mat()
+            val vb = mat()
+            val vc = mat()
+            Core.compare(a32, Scalar(0.0), va, Core.CMP_GT)
+            Core.compare(b32, Scalar(0.0), vb, Core.CMP_GT)
+            Core.compare(conv, Scalar(0.0), vc, Core.CMP_GT)
+            Core.bitwise_and(vb, vc, vb)
+            val both = mat()
+            Core.bitwise_and(va, vb, both)
+            val diff = mat()
+            Core.absdiff(a32, conv, diff)
+            val agree = mat()
+            val conflict = mat()
+            Core.compare(diff, Scalar(FUSE_AGREE), agree, Core.CMP_LT)
+            Core.bitwise_and(agree, both, agree)
+            Core.compare(diff, Scalar(FUSE_CONFLICT), conflict, Core.CMP_GT)
+            Core.bitwise_and(conflict, both, conflict)
+            val onlyB = mat()
+            Core.bitwise_not(va, onlyB)
+            Core.bitwise_and(onlyB, vb, onlyB)
+            // converting divides the other pair's noise by the slope, so weight it accordingly
+            val w = slope * slope / (1 + slope * slope)
+            val avg = mat()
+            Core.addWeighted(a32, 1 - w, conv, w, 0.0, avg)
+            avg.copyTo(a32, agree)
+            conv.copyTo(a32, onlyB)
+            a32.setTo(Scalar(-1.0), conflict)
+            a32.convertTo(disp, CvType.CV_16S, 16.0)
+            return "third camera: %d px confirmed, %d filled, %d rejected".format(
+                Core.countNonZero(agree), Core.countNonZero(onlyB), Core.countNonZero(conflict),
+            )
+        } finally {
+            temps.forEach { it.release() }
+        }
+    }
+
+    /**
+     * Turns a disparity map from [match] into the pictures and numbers shown on screen,
+     * and releases it.
+     *
+     * @param motion how pixels moved since the previous call (see
+     *        StereoGeometry.motionHomography with this engine's [rect]), or null if unknown
+     * @param keep weight of the previous frame in the temporal blend, 0..1
+     */
+    fun finish(disp: Mat, view: View, motion: DoubleArray?, keep: Double, startNs: Long): DepthResult {
+        val start = startNs
+        smooth(disp, motion, keep)
 
         // statistics
         val valid = Mat()
@@ -516,11 +636,22 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     /**
      * Blends the disparity with the previous frame where the two agree, which removes
      * most frame-to-frame flicker without smearing pixels whose depth really changed.
+     * With [motion] the previous frame is first moved to follow the camera's rotation, so
+     * the blend also holds while the phone is turning.
      */
-    private fun smooth(disp: Mat) {
+    private fun smooth(disp: Mat, motion: DoubleArray?, keep: Double) {
         val cur = Mat()
         disp.convertTo(cur, CvType.CV_32F)
-        val prev = previous
+        var prev = previous
+        if (prev != null && prev.size() == cur.size() && motion != null) {
+            // move the previous result to where the scene is now, as measured by the gyroscope
+            val hm = mat3(motion)
+            val warped = Mat()
+            Imgproc.warpPerspective(prev, warped, hm, size, Imgproc.INTER_NEAREST, Core.BORDER_CONSTANT, Scalar(-16.0))
+            hm.release()
+            prev.release()
+            prev = warped
+        }
         if (prev != null && prev.size() == cur.size()) {
             val diff = Mat()
             val mask = Mat()
@@ -532,11 +663,12 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             Core.compare(cur, Scalar(0.0), valid, Core.CMP_GT)
             Core.bitwise_and(mask, valid, mask)
             val blended = Mat()
-            Core.addWeighted(cur, 1 - SMOOTH_KEEP, prev, SMOOTH_KEEP, 0.0, blended)
+            Core.addWeighted(cur, 1 - keep, prev, keep, 0.0, blended)
             blended.copyTo(cur, mask)
             cur.convertTo(disp, CvType.CV_16S)
-            listOf(diff, mask, valid, blended, prev).forEach { it.release() }
+            listOf(diff, mask, valid, blended).forEach { it.release() }
         }
+        prev?.release()
         previous = cur
     }
 
@@ -552,7 +684,9 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private companion object {
         const val BLOCK = 5
         const val RANGE_KEEP = 0.85 // weight of the previous colour range
-        const val SMOOTH_KEEP = 0.6 // weight of the previous frame
+        const val FUSE_KEEP = 0.8 // weight of the previous relation between the two pairs
+        const val FUSE_AGREE = 1.5 // pixels of disparity within which two pairs confirm each other
+        const val FUSE_CONFLICT = 3.0 // beyond this at least one of them is a false match
         const val SMOOTH_MAX_JUMP = 1.5 // pixels of disparity; larger changes are taken as real
     }
 }

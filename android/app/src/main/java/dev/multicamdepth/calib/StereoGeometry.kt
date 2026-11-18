@@ -299,6 +299,77 @@ object StereoGeometry {
         return Direction(cos(angle), sin(angle), bestCount)
     }
 
+    /**
+     * How image points move when the phone turns, as a homography taking a pixel of the
+     * earlier frame to the same scene point in the later one (rotation only; depth is not
+     * needed for that).
+     *
+     * @param deviceRotation gyro rotation R with p_earlier = R * p_later (device frame)
+     * @param deviceToCamera device axes -> camera axes, see [orientationRotation]
+     * @param rect camera -> rectified view (identity for an unrectified image)
+     */
+    fun motionHomography(
+        deviceRotation: DoubleArray,
+        deviceToCamera: DoubleArray,
+        rect: DoubleArray,
+        f: Double,
+        cx: Double,
+        cy: Double,
+    ): DoubleArray {
+        val toView = Mat3.mul(rect, deviceToCamera)
+        val m = Mat3.mul(Mat3.mul(toView, Mat3.transpose(deviceRotation)), Mat3.transpose(toView))
+        val k = doubleArrayOf(f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0)
+        val kInv = doubleArrayOf(1 / f, 0.0, -cx / f, 0.0, 1 / f, -cy / f, 0.0, 0.0, 1.0)
+        return Mat3.mul(Mat3.mul(k, m), kInv)
+    }
+
+    class Line(val slope: Double, val offset: Double, val inliers: Int)
+
+    /**
+     * Robust y = slope * x + offset. Null if there are too few points or x does not vary
+     * enough to pin down the slope.
+     */
+    fun fitLine(x: FloatArray, y: FloatArray, tol: Double = 0.75, iterations: Int = 200): Line? {
+        val n = x.size
+        if (n < 50) return null
+        val sorted = x.sortedArray()
+        val spread = sorted[(n * 0.95).toInt()] - sorted[(n * 0.05).toInt()]
+        if (spread < 1.0) return null
+        val rng = Random(3)
+        var bestCount = 0
+        var ba = 0.0
+        var bb = 0.0
+        repeat(iterations) {
+            val i = rng.nextInt(n)
+            val j = rng.nextInt(n)
+            if (abs(x[i] - x[j]) < 0.5 * spread) return@repeat
+            val a = (y[i] - y[j]).toDouble() / (x[i] - x[j])
+            val b = y[i] - a * x[i]
+            val count = (0 until n).count { abs(a * x[it] + b - y[it]) < tol }
+            if (count > bestCount) {
+                bestCount = count
+                ba = a
+                bb = b
+            }
+        }
+        if (bestCount < 50) return null
+        // least squares on the inliers
+        var sx = 0.0
+        var sy = 0.0
+        var sxx = 0.0
+        var sxy = 0.0
+        var m = 0
+        for (i in 0 until n) {
+            if (abs(ba * x[i] + bb - y[i]) >= tol) continue
+            sx += x[i]; sy += y[i]; sxx += x[i].toDouble() * x[i]; sxy += x[i].toDouble() * y[i]; m++
+        }
+        val den = m * sxx - sx * sx
+        if (abs(den) < 1e-9) return null
+        val a = (m * sxy - sx * sy) / den
+        val b = (sy - a * sx) / m
+        return Line(a, b, (0 until n).count { abs(a * x[it] + b - y[it]) < tol })
+    }
+
     /** Rotation vector (axis * angle, radians) -> rotation matrix. */
     fun rodrigues(w: DoubleArray): DoubleArray {
         val angle = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])

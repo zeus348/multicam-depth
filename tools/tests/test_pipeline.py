@@ -143,3 +143,50 @@ def test_parallax_direction_ignores_stray_matches():
     d, n = geometry.parallax_direction(np.vstack([good, stray]))
     assert d is not None and n > 60 and abs(d @ u) > 0.995
     assert geometry.parallax_direction(rng.uniform(-60, 60, (100, 2)))[0] is None
+
+
+def test_fit_line_is_robust():
+    rng = np.random.default_rng(1)
+    x = rng.uniform(2, 30, 500)
+    y = 1.8 * x - 4 + rng.normal(0, 0.1, 500)
+    y[::6] = rng.uniform(0, 60, len(y[::6]))
+    a, b, n = geometry.fit_line(x, y)
+    assert a == pytest.approx(1.8, abs=0.02) and b == pytest.approx(-4, abs=0.3) and n > 380
+    assert geometry.fit_line(np.full(500, 5.0), y)[0] is None  # flat scene: slope unknowable
+
+
+def test_gyro_integration_recovers_a_constant_turn():
+    t = np.arange(0, 101) * 5_000_000  # 200 Hz for half a second
+    rates = np.tile([0.0, 0.4, 0.0], (len(t), 1))
+    r = geometry.integrate_gyro(t, rates, t[10], t[90])
+    np.testing.assert_allclose(r, geometry.rodrigues([0, 0.4 * 0.4, 0]), atol=1e-9)
+    np.testing.assert_allclose(geometry.integrate_gyro(t, rates, t[5], t[5]), np.eye(3))
+
+
+def test_third_camera_fills_holes_and_removes_false_matches():
+    from mcdepth.pipeline import fuse_disparities, warp_disparity
+
+    wide, tele = synth.phone_rig3()
+    ref, aux, truth = synth.render_pair(wide, near=0.45, far=1.2)
+    aux2, _ = synth.render(tele.aux, tele.r, tele.t, near=0.45, far=1.2)
+    a = StereoDepth(wide, out_size=(640, 480))
+    b = StereoDepth(tele, out_size=(640, 480))
+    _, _, disp_a, _ = a.compute(ref, aux)
+    _, _, disp_b, _ = b.compute(ref, aux2)
+    assert np.isfinite(disp_b).mean() > 0.5
+    moved = warp_disparity(disp_b, b, a)
+    centre = np.isfinite(moved)
+    assert 0.1 < centre.mean() < 0.4  # the telephoto only sees the middle of the main view
+
+    # damage the first pair the way real scenes do: a hole and a patch of false matches
+    damaged = disp_a.copy()
+    damaged[200:240, 280:340] = np.nan
+    damaged[250:270, 300:360] += 12
+    fused, info = fuse_disparities(damaged, moved)
+    assert info["fused"] and info["filled"] >= 1500 and info["dropped"] >= 800
+    expect = wide.ref.k[0, 0] / 2 * 0.01503 / 0.45  # true disparity of the near square
+    assert np.nanmedian(fused[200:240, 280:340]) == pytest.approx(expect, abs=0.6)
+    assert np.isnan(fused[250:270, 300:360]).mean() > 0.8
+    # and it must not make the untouched part worse
+    untouched = np.isfinite(disp_a) & np.isfinite(fused)
+    assert np.nanmedian(np.abs(fused - disp_a)[untouched]) < 0.25

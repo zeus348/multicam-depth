@@ -29,12 +29,27 @@ def load_rig(session: Path) -> StereoRig:
     )
 
 
+def load_rig2(session: Path) -> StereoRig | None:
+    """The reference camera with the third camera, if the session has one."""
+    c = json.loads((session / "calibration.json").read_text())
+    if "aux2" not in c:
+        return None
+    s = c["stereo2"]
+    return StereoRig(
+        ref=_camera(c["ref"]),
+        aux=_camera(c["aux2"]),
+        r=np.array(s["R"], float).reshape(3, 3),
+        t=np.array(s["T"], float),
+        metric=s.get("metric", True),
+    )
+
+
 def load_frames(session: Path) -> list[dict]:
     with open(session / "frames.csv") as f:
         return list(csv.DictReader(f))
 
 
-def write_calibration(session: Path, rig: StereoRig, extra: dict | None = None):
+def write_calibration(session: Path, rig: StereoRig, extra: dict | None = None, rig2: StereoRig | None = None):
     def cam(c: Camera, cid: str):
         return {
             "id": cid,
@@ -50,5 +65,8 @@ def write_calibration(session: Path, rig: StereoRig, extra: dict | None = None):
         "aux": cam(rig.aux, "1"),
         "stereo": {"R": rig.r.flatten().tolist(), "T": rig.t.tolist(), "metric": rig.metric},
     }
+    if rig2 is not None:
+        doc["aux2"] = cam(rig2.aux, "2")
+        doc["stereo2"] = {"R": rig2.r.flatten().tolist(), "T": rig2.t.tolist(), "metric": rig2.metric}
     doc.update(extra or {})
     (session / "calibration.json").write_text(json.dumps(doc, indent=2))

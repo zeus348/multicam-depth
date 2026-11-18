@@ -37,6 +37,8 @@ class StereoDepth:
             rig.ref.k[0, 0], rig.ref.width, rig.aux.k[0, 0], rig.aux.width, self.out_w, self.out_h
         )
         self.max_disparity = max_disparity
+        # the app uses the faster 3-direction matcher; offline the fuller one streaks less
+        self.sgbm_mode = cv2.STEREO_SGBM_MODE_SGBM
         self._reset()
 
     def _reset(self):
@@ -245,7 +247,7 @@ class StereoDepth:
             uniquenessRatio=10,
             speckleWindowSize=100,
             speckleRange=2,
-            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+            mode=self.sgbm_mode,
         )
 
         # The matcher cannot fill the first `nd` columns; padding moves that blind strip
@@ -259,6 +261,7 @@ class StereoDepth:
         xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
         landed = cv2.remap(valid_right, xs - np.maximum(disp, 0), ys, cv2.INTER_NEAREST)
         disp[(landed == 0) | (valid_left == 0)] = -1
+        disp = despeckle(disp)
         if flipped:
             disp = cv2.flip(disp, 1)
         if self.rect.vertical:
@@ -274,6 +277,63 @@ class StereoDepth:
         rect_ref, rect_aux = self.rectify(img_ref, img_aux)
         disp = self.disparity(rect_ref, rect_aux)
         return rect_ref, rect_aux, disp, self.depth_from_disparity(disp)
+
+
+def despeckle(disp: np.ndarray) -> np.ndarray:
+    """5x5 median over valid disparities (invalid = anything <= 0); removes thin streaks
+    and isolated wrong matches while keeping edges."""
+    as_u16 = np.clip(disp * 16, 0, 65535).astype(np.uint16)
+    out = cv2.medianBlur(as_u16, 5).astype(np.float32) / 16.0
+    out[(out <= 0) | (disp <= 0)] = -1
+    return out
+
+
+def warp_disparity(disp, src: "StereoDepth", dst: "StereoDepth") -> np.ndarray:
+    """Resample a disparity map from src's rectified reference view into dst's. Both must
+    share the same reference camera, so the two views differ only by a rotation and focal
+    length. Values are not rescaled; see fuse_disparities."""
+    h = src.k_new @ src.rect.r1 @ dst.rect.r1.T @ np.linalg.inv(dst.k_new)  # dst pixel -> src pixel
+    filled = np.where(np.isfinite(disp), disp, -1).astype(np.float32)
+    out = cv2.warpPerspective(
+        filled, h, (dst.out_w, dst.out_h), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=-1,
+    )
+    out[out <= 0] = np.nan
+    return out
+
+
+def fuse_disparities(primary, secondary, agree_px=1.5, conflict_px=3.0):
+    """Combine two disparity maps of the same view from different camera pairs.
+
+    Both are affine in inverse depth, so they are related by  secondary = a*primary + b.
+    That line is fitted where both are valid, the secondary is converted into the
+    primary's units, and then per pixel:
+      both agree      -> average, weighted by how sensitive each pair is to depth
+      clear conflict  -> dropped (at least one is a false match)
+      only one valid  -> that one (the pairs see around different occlusions)
+    Returns (fused, info). If the line cannot be fitted the primary is returned unchanged.
+    """
+    va, vb = np.isfinite(primary), np.isfinite(secondary)
+    both = va & vb
+    info = {"overlap": int(both.sum()), "fused": False}
+    a, b, inliers = geometry.fit_line(primary[both][::7], secondary[both][::7])
+    if a is None or a <= 0:
+        return primary, info
+    converted = (secondary - b) / a
+    converted[~(converted > 0)] = np.nan
+    vb = np.isfinite(converted)
+    both = va & vb
+    diff = np.abs(primary - converted)
+    w = a * a / (1 + a * a)  # weight of the secondary: its noise shrinks by a when converted
+    out = primary.copy()
+    agree = both & (diff < agree_px)
+    out[agree] = (1 - w) * primary[agree] + w * converted[agree]
+    out[both & (diff > conflict_px)] = np.nan
+    only_b = vb & ~va
+    out[only_b] = converted[only_b]
+    info.update(fused=True, scale=a, offset=b, agree=int(agree.sum()),
+                dropped=int((both & (diff > conflict_px)).sum()), filled=int(only_b.sum()))
+    return out, info
 
 
 def _gray(img):

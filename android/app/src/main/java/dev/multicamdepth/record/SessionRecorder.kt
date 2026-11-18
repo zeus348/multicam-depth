@@ -30,7 +30,15 @@ import java.util.zip.ZipOutputStream
  * Writes one recording: JPEG pairs, per-frame sensor timestamps, IMU samples and the
  * calibration. Layout is described in docs/session-format.md.
  */
-class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private val sensors: SensorManager) {
+class SessionRecorder(
+    val dir: File,
+    pair: CameraPair,
+    rig: StereoRig,
+    /** the reference camera with the third camera, when three are streaming */
+    rig2: StereoRig?,
+    private val sensors: SensorManager,
+) {
+    private val threeCameras = rig2 != null
     private val writer = ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, ArrayBlockingQueue(QUEUE)) { r -> Thread(r, "recorder") }
     private val frames: BufferedWriter
     private val imu: BufferedWriter
@@ -51,9 +59,10 @@ class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private v
     init {
         File(dir, "ref").mkdirs()
         File(dir, "aux").mkdirs()
-        File(dir, "calibration.json").writeText(calibrationJson(pair, rig).toString(2))
+        if (threeCameras) File(dir, "aux2").mkdirs()
+        File(dir, "calibration.json").writeText(calibrationJson(pair, rig, rig2).toString(2))
         frames = File(dir, "frames.csv").bufferedWriter()
-        frames.write("index,t_ref_ns,t_aux_ns,ref_file,aux_file\n")
+        frames.write("index,t_ref_ns,t_aux_ns,ref_file,aux_file" + (if (threeCameras) ",t_aux2_ns,aux2_file" else "") + "\n")
         imu = File(dir, "imu.csv").bufferedWriter()
         imu.write("t_ns,sensor,x,y,z\n")
         val handler = Handler(imuThread.looper)
@@ -65,14 +74,20 @@ class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private v
     }
 
     /** Queues a pair for writing. If storage cannot keep up the pair is skipped, never blocking the camera. */
-    fun add(ref: Frame, aux: Frame) {
+    fun add(ref: Frame, aux: Frame, aux2: Frame?) {
+        if (threeCameras && aux2 == null) return // keep every row complete
         val i = index++
         try {
             writer.execute {
                 val name = "%06d.jpg".format(i)
                 jpeg(ref, File(dir, "ref/$name"))
                 jpeg(aux, File(dir, "aux/$name"))
-                frames.write("$i,${ref.timestampNs},${aux.timestampNs},ref/$name,aux/$name\n")
+                var row = "$i,${ref.timestampNs},${aux.timestampNs},ref/$name,aux/$name"
+                if (threeCameras && aux2 != null) {
+                    jpeg(aux2, File(dir, "aux2/$name"))
+                    row += ",${aux2.timestampNs},aux2/$name"
+                }
+                frames.write(row + "\n")
                 written.incrementAndGet()
             }
         } catch (e: java.util.concurrent.RejectedExecutionException) {
@@ -95,7 +110,7 @@ class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private v
         }
     }
 
-    private fun calibrationJson(pair: CameraPair, rig: StereoRig): JSONObject {
+    private fun calibrationJson(pair: CameraPair, rig: StereoRig, rig2: StereoRig?): JSONObject {
         fun cam(c: CameraModel) = JSONObject()
             .put("id", c.id).put("width", c.width).put("height", c.height)
             .put("intrinsics", JSONArray(doubleArrayOf(c.k.fx, c.k.fy, c.k.cx, c.k.cy)))
@@ -110,6 +125,8 @@ class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private v
             .put("lens_pose_rotation", p.poseRotation?.let { JSONArray(it) } ?: JSONObject.NULL)
             .put("lens_pose_translation", p.poseTranslation?.let { JSONArray(it) } ?: JSONObject.NULL)
 
+        fun stereo(r: StereoRig) = JSONObject().put("R", JSONArray(r.r)).put("T", JSONArray(r.t)).put("metric", r.metric)
+
         return JSONObject()
             .put("format", 1)
             .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
@@ -122,9 +139,17 @@ class SessionRecorder(val dir: File, pair: CameraPair, rig: StereoRig, private v
             .put("timestamp_source", pair.timestampSource ?: JSONObject.NULL)
             .put("ref", cam(rig.ref))
             .put("aux", cam(rig.aux))
-            .put("stereo", JSONObject().put("R", JSONArray(rig.r)).put("T", JSONArray(rig.t)).put("metric", rig.metric))
+            .put("stereo", stereo(rig))
             .put("calibration_source", rig.source)
             .put("reported", JSONObject().put("ref", raw(pair.ref)).put("aux", raw(pair.aux)))
+            .apply {
+                if (rig2 != null && pair.aux2 != null) {
+                    put("aux2", cam(rig2.aux))
+                    put("stereo2", stereo(rig2)) // X_aux2 = R * X_ref + T
+                    put("calibration_source2", rig2.source)
+                    getJSONObject("reported").put("aux2", raw(pair.aux2))
+                }
+            }
     }
 
     companion object {

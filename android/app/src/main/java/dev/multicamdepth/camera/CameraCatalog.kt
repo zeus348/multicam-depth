@@ -8,7 +8,10 @@ import dev.multicamdepth.calib.PhysicalCamera
 import kotlin.math.abs
 import kotlin.math.ln
 
-/** A logical camera together with two of its physical cameras. [ref] is the narrower lens. */
+/**
+ * A logical camera together with two or three of its physical cameras. [ref] is the camera
+ * every depth map is expressed in; [aux2], when present, forms a second stereo pair with it.
+ */
 class CameraPair(
     val logicalId: String,
     val facing: Int,
@@ -19,16 +22,20 @@ class CameraPair(
     val hasDistortionCorrection: Boolean,
     val ref: PhysicalCamera,
     val aux: PhysicalCamera,
+    val aux2: PhysicalCamera? = null,
 ) {
     val label: String
         get() {
             val side = if (facing == CameraMetadata.LENS_FACING_FRONT) "front" else "back"
-            return "$side: ${ref.id} (${"%.1f".format(ref.focalMm)} mm) + ${aux.id} (${"%.1f".format(aux.focalMm)} mm)"
+            fun name(c: PhysicalCamera) = "${c.id} (${"%.1f".format(c.focalMm)} mm)"
+            return "$side: ${name(ref)} + ${name(aux)}" + (aux2?.let { " + ${name(it)}" } ?: "")
         }
 
     /** Largest 4:3 (else any) YUV size both cameras offer, at most [maxWidth] wide. */
     fun commonSize(maxWidth: Int = 1280): Pair<Int, Int>? {
-        val common = ref.yuvSizes.intersect(aux.yuvSizes.toSet()).filter { it.first <= maxWidth }
+        var shared = ref.yuvSizes.intersect(aux.yuvSizes.toSet())
+        aux2?.let { shared = shared.intersect(it.yuvSizes.toSet()) }
+        val common = shared.filter { it.first <= maxWidth }
         return common.filter { it.first * 3 == it.second * 4 }.maxByOrNull { it.first }
             ?: common.maxByOrNull { it.first * it.second }
     }
@@ -36,7 +43,10 @@ class CameraPair(
 
 object CameraCatalog {
 
-    /** All usable pairs, back cameras first, most similar fields of view first. */
+    /**
+     * All usable combinations: three-camera sets first, then pairs; back cameras first,
+     * most similar fields of view first.
+     */
     fun pairs(manager: CameraManager): List<CameraPair> {
         val out = ArrayList<CameraPair>()
         for (id in manager.cameraIdList) {
@@ -47,24 +57,33 @@ object CameraCatalog {
                 runCatching { describe(pid, manager.getCameraCharacteristics(pid)) }.getOrNull()
             }
             val modes = chars.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+            fun combo(ref: PhysicalCamera, aux: PhysicalCamera, aux2: PhysicalCamera?) = CameraPair(
+                logicalId = id,
+                facing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraMetadata.LENS_FACING_BACK,
+                sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
+                syncType = chars.get(CameraCharacteristics.LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE),
+                timestampSource = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
+                canDisableDistortionCorrection =
+                    modes?.contains(CameraMetadata.DISTORTION_CORRECTION_MODE_OFF) == true,
+                hasDistortionCorrection = modes != null && modes.any { it != CameraMetadata.DISTORTION_CORRECTION_MODE_OFF },
+                ref = ref,
+                aux = aux,
+                aux2 = aux2,
+            )
             for (i in physical.indices) for (j in i + 1 until physical.size) {
                 val (ref, aux) = listOf(physical[i], physical[j]).sortedBy { it.fovRatio }
-                out += CameraPair(
-                    logicalId = id,
-                    facing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraMetadata.LENS_FACING_BACK,
-                    sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
-                    syncType = chars.get(CameraCharacteristics.LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE),
-                    timestampSource = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
-                    canDisableDistortionCorrection =
-                        modes?.contains(CameraMetadata.DISTORTION_CORRECTION_MODE_OFF) == true,
-                    hasDistortionCorrection = modes != null && modes.any { it != CameraMetadata.DISTORTION_CORRECTION_MODE_OFF },
-                    ref = ref,
-                    aux = aux,
-                )
+                out += combo(ref, aux, null)
+            }
+            if (physical.size >= 3) {
+                // narrowest, middle, widest: the middle one overlaps both others, so it is the
+                // reference; the wider one covers its whole view, the narrower one its centre
+                val byFov = physical.sortedBy { it.fovRatio }
+                out += combo(byFov[1], byFov[2], byFov[0])
             }
         }
         return out.filter { it.commonSize() != null }.sortedWith(
             compareBy<CameraPair> { it.facing != CameraMetadata.LENS_FACING_BACK }
+                .thenBy { it.aux2 == null }
                 .thenBy { abs(ln(it.aux.fovRatio / it.ref.fovRatio)) },
         )
     }

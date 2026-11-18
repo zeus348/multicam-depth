@@ -67,3 +67,14 @@ def render_pair(rig: StereoRig, **scene):
     ref, depth = render(rig.ref, np.eye(3), np.zeros(3), **scene)
     aux, _ = render(rig.aux, rig.r, rig.t, **scene)
     return ref, aux, depth
+
+
+def phone_rig3(width=1280, height=960):
+    """Main (reference), ultrawide and telephoto. Returns two rigs sharing the reference."""
+    wide = phone_rig(width, height, baseline=(0.001, 0.015, 0.0), tilt_deg=0.3)
+    f_tele = 1.6 * width
+    k = np.array([[f_tele, 0, width / 2 - 4], [0, f_tele, height / 2 + 5], [0, 0, 1.0]])
+    r, _ = cv2.Rodrigues(np.deg2rad([0.2, -0.3, 0.4]))
+    c3 = np.array([0.018, 0.010, 0.0])
+    tele = StereoRig(ref=wide.ref, aux=Camera(width, height, k), r=r, t=-r @ c3)
+    return wide, tele

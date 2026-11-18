@@ -42,7 +42,17 @@ to fix things on first run; the info panel in the app prints what the phone repo
    because the true lens spacing and the zero-disparity point are unknown. The app
    retries until an alignment succeeds.
 5. **Match.** OpenCV semi-global block matching gives disparity `d`; depth is
-   `focal_px * baseline / d`.
+   `focal_px * baseline / d`. A 5x5 median removes thin streaks.
+6. **Third camera.** With three cameras the middle lens is the reference and forms a
+   pair with each of the others. Each pair's disparity is affine in inverse depth, so
+   the two are related by a line, fitted where both are valid. Then per pixel:
+   agreeing values are averaged, clear conflicts are dropped as false matches, and
+   holes in one pair are filled from the other. The telephoto only covers the centre
+   of the view. If the phone cannot run three sensors at once the app falls back to two.
+7. **Gyroscope.** The previous depth frame is blended into the new one to suppress
+   flicker. The gyroscope's rotation since that frame says where each pixel has moved
+   to, so the blend holds while the phone turns. Alignment waits until the phone is
+   held still. This needs camera and IMU timestamps on the same clock.
 
 ### What to expect
 

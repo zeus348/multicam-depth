@@ -284,3 +284,50 @@ def refine_rotation(r, rays_aux, target, mask, tol, iters=3):
     q = rays_aux @ r.T
     agree = np.hypot(*(target - q[:, :2] / q[:, 2:]).T) < tol
     return r, int(agree.sum())
+
+
+def fit_line(x, y, tol=0.75, iters=200, seed=3):
+    """Robust y = a*x + b. Returns (a, b, inlier count), or (None, None, n) if there
+    are too few points or x does not vary enough to pin down the slope."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = len(x)
+    if n < 50:
+        return None, None, n
+    lo, hi = np.percentile(x, [5, 95])
+    if hi - lo < 1.0:
+        return None, None, n
+    rng = np.random.default_rng(seed)
+    best, best_count = None, 0
+    for _ in range(iters):
+        i, j = rng.integers(0, n, 2)
+        if abs(x[i] - x[j]) < 0.5 * (hi - lo):
+            continue
+        a = (y[i] - y[j]) / (x[i] - x[j])
+        b = y[i] - a * x[i]
+        inl = np.abs(a * x + b - y) < tol
+        if inl.sum() > best_count:
+            best_count, best = int(inl.sum()), inl
+    if best is None or best_count < 50:
+        return None, None, best_count
+    a, b = np.polyfit(x[best], y[best], 1)
+    return float(a), float(b), int((np.abs(a * x + b - y) < tol).sum())
+
+
+def integrate_gyro(times_ns, rates, t0_ns, t1_ns) -> np.ndarray:
+    """Rotation of the device between two instants from gyroscope samples.
+
+    times_ns: (N,) sample times, rates: (N,3) rad/s in the device frame.
+    Returns R with  p_at_t0 = R @ p_at_t1  for a direction p fixed to the device.
+    """
+    times_ns = np.asarray(times_ns)
+    rates = np.asarray(rates, float)
+    r = np.eye(3)
+    for i in range(len(times_ns)):
+        start = max(t0_ns, times_ns[i - 1] if i else times_ns[i])
+        end = min(t1_ns, times_ns[i])
+        if i == len(times_ns) - 1 and times_ns[i] < t1_ns:
+            end = t1_ns  # hold the last sample to the end of the interval
+        if end > start:
+            r = r @ rodrigues(rates[i] * (end - start) * 1e-9)
+    return r

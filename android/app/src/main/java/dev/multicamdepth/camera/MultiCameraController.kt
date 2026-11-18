@@ -16,28 +16,35 @@ import android.os.HandlerThread
 import java.util.concurrent.Executor
 
 /**
- * Opens one logical camera and streams two of its physical cameras at the same time.
- * Every matched pair of frames is delivered to [onPair] on the camera thread.
+ * Opens one logical camera and streams two or three of its physical cameras at the same
+ * time. Every synchronised set of frames is delivered to [onFrames] on the camera thread;
+ * the third frame is null when only two cameras are running.
+ *
+ * Not every phone can run three sensors at once. If the three-stream session is refused,
+ * or delivers nothing, the controller falls back to two and says so through [onNotice].
  */
-class DualCameraController(
+class MultiCameraController(
     private val manager: CameraManager,
     private val pair: CameraPair,
     private val width: Int,
     private val height: Int,
     /** true: ask the phone for uncorrected images (the app then undistorts them itself) */
     private val disableDistortionCorrection: Boolean,
-    private val onPair: (ref: Frame, aux: Frame) -> Unit,
+    private val onFrames: (ref: Frame, aux: Frame, aux2: Frame?) -> Unit,
+    private val onNotice: (String) -> Unit,
     private val onError: (String) -> Unit,
 ) {
     private val thread = HandlerThread("camera").apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
-    private val pairer = FramePairer<Frame>(PAIR_TOLERANCE_NS) { it.timestampNs }
+    private var sync = FrameSync<Frame>(2, PAIR_TOLERANCE_NS) { it.timestampNs }
     private var device: CameraDevice? = null
-    private var refReader: ImageReader? = null
-    private var auxReader: ImageReader? = null
+    private var readers: List<ImageReader> = emptyList()
+    private var delivered = 0L
 
-    val droppedFrames get() = pairer.dropped
+    /** how many cameras are actually streaming */
+    @Volatile var activeCameras = 0
+        private set
 
     @SuppressLint("MissingPermission") // the activity only constructs this after the permission is granted
     fun open() {
@@ -45,7 +52,7 @@ class DualCameraController(
             manager.openCamera(pair.logicalId, executor, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     device = camera
-                    startSession(camera)
+                    startSession(camera, if (pair.aux2 != null) 3 else 2)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) = camera.close()
@@ -64,28 +71,37 @@ class DualCameraController(
         handler.post {
             device?.close()
             device = null
-            refReader?.close()
-            auxReader?.close()
-            pairer.clear()
+            readers.forEach { it.close() }
+            readers = emptyList()
             thread.quitSafely()
         }
     }
 
-    private fun startSession(camera: CameraDevice) {
-        val ref = reader { pairer.addRef(it) }
-        val aux = reader { pairer.addAux(it) }
-        refReader = ref
-        auxReader = aux
-        val outputs = listOf(
-            OutputConfiguration(ref.surface).apply { setPhysicalCameraId(pair.ref.id) },
-            OutputConfiguration(aux.surface).apply { setPhysicalCameraId(pair.aux.id) },
-        )
+    private fun startSession(camera: CameraDevice, cameras: Int) {
+        val old = readers // still in use by the session being replaced; closed once the new one runs
+        val ids = listOfNotNull(pair.ref.id, pair.aux.id, pair.aux2?.id).take(cameras)
+        val groups = FrameSync<Frame>(cameras, PAIR_TOLERANCE_NS) { it.timestampNs }
+        sync = groups
+        delivered = 0
+        val created = ids.indices.map { stream -> reader(stream, groups) }
+        readers = created
+        val outputs = created.mapIndexed { i, r -> OutputConfiguration(r.surface).apply { setPhysicalCameraId(ids[i]) } }
+
+        fun fallBack(why: String) {
+            if (cameras == 3 && device === camera) {
+                onNotice("three cameras at once: $why. Using two.")
+                startSession(camera, 2)
+            } else {
+                onError("this phone refused to stream cameras ${ids.joinToString(" and ")} together at ${width}x$height ($why)")
+            }
+        }
+
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
+                old.forEach { it.close() }
                 try {
                     val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(ref.surface)
-                        addTarget(aux.surface)
+                        created.forEach { addTarget(it.surface) }
                         // anything that moves the lens or warps the image breaks the calibration
                         set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
                         set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
@@ -94,33 +110,47 @@ class DualCameraController(
                         }
                     }
                     session.setRepeatingRequest(request.build(), null, handler)
+                    activeCameras = cameras
+                    if (cameras == 3) {
+                        // some phones accept the session but never deliver all three streams
+                        handler.postDelayed({
+                            if (device === camera && sync === groups && delivered == 0L) fallBack("no frames arrived")
+                        }, STARTUP_TIMEOUT_MS)
+                    }
                 } catch (e: Exception) {
-                    onError("cannot start capture: ${e.message}")
+                    fallBack(e.message ?: "capture could not start")
                 }
             }
 
-            override fun onConfigureFailed(session: CameraCaptureSession) =
-                onError("this phone refused to stream cameras ${pair.ref.id} and ${pair.aux.id} together at ${width}x$height")
+            override fun onConfigureFailed(session: CameraCaptureSession) = fallBack("refused by the phone")
         }
         try {
             camera.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor, callback))
         } catch (e: Exception) {
-            onError("cannot configure cameras: ${e.message}")
+            fallBack(e.message ?: "session could not be created")
         }
     }
 
-    private fun reader(add: (Frame) -> Pair<Frame, Frame>?): ImageReader =
+    private fun reader(stream: Int, groups: FrameSync<Frame>): ImageReader =
         ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 3).apply {
             setOnImageAvailableListener({ r ->
-                val image = r.acquireNextImage() ?: return@setOnImageAvailableListener
+                val image = try {
+                    r.acquireNextImage()
+                } catch (e: IllegalStateException) {
+                    null // reader was closed while this callback was queued
+                } ?: return@setOnImageAvailableListener
                 val frame = image.use { Frame(it.timestamp, it.width, it.height, toNv21(it)) }
-                add(frame)?.let { (a, b) -> onPair(a, b) }
+                groups.add(stream, frame)?.let {
+                    delivered++
+                    onFrames(it[0], it[1], it.getOrNull(2))
+                }
             }, handler)
         }
 
     private companion object {
         /** Half a frame at 30 fps: sensors that are not hardware synced still pair up. */
         const val PAIR_TOLERANCE_NS = 16_000_000L
+        const val STARTUP_TIMEOUT_MS = 4000L
 
         fun toNv21(image: Image): ByteArray {
             val w = image.width

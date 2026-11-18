@@ -5,8 +5,9 @@ One directory per recording, written by the app to
 
 | File | Content |
 |---|---|
-| `ref/NNNNNN.jpg`, `aux/NNNNNN.jpg` | Frame pair `NNNNNN`, as delivered by the sensor (not rotated, not rectified). `ref` is the narrower lens. |
-| `frames.csv` | `index,t_ref_ns,t_aux_ns,ref_file,aux_file`. Timestamps are each sensor's own start-of-exposure time (`Image.getTimestamp()`). |
+| `ref/NNNNNN.jpg`, `aux/NNNNNN.jpg` | Frame pair `NNNNNN`, as delivered by the sensor (not rotated, not rectified). `ref` is the camera depth is expressed in. |
+| `aux2/NNNNNN.jpg` | Only when three cameras were streaming: the third camera's frame of the same set. |
+| `frames.csv` | `index,t_ref_ns,t_aux_ns,ref_file,aux_file`, plus `t_aux2_ns,aux2_file` with three cameras. Timestamps are each sensor's own start-of-exposure time (`Image.getTimestamp()`). |
 | `imu.csv` | `t_ns,sensor,x,y,z` with `sensor` = `accel` (m/s²) or `gyro` (rad/s), at the fastest rate the phone allows. |
 | `calibration.json` | See below. |
 
@@ -25,6 +26,7 @@ One directory per recording, written by the app to
   "aux": { ... },
   "stereo": { "R": [9 numbers, row-major], "T": [x, y, z],   // X_aux = R * X_ref + T, metres
               "metric": true },    // false: the phone published no camera positions, baseline is a guess
+  "aux2": { ... }, "stereo2": { ... },   // three cameras only: X_aux2 = R * X_ref + T
   "calibration_source": "...",     // which parts were published and which were derived
   "reported": { "ref": {...}, "aux": {...} }   // raw Camera2 values, for re-deriving the calibration
 }

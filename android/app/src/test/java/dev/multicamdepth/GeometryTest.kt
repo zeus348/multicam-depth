@@ -5,7 +5,8 @@ import dev.multicamdepth.calib.Intrinsics
 import dev.multicamdepth.calib.Mat3
 import dev.multicamdepth.calib.PhysicalCamera
 import dev.multicamdepth.calib.StereoGeometry
-import dev.multicamdepth.camera.FramePairer
+import dev.multicamdepth.camera.FrameSync
+import dev.multicamdepth.fusion.GyroIntegrator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -213,21 +214,64 @@ class GeometryTest {
     }
 
     @Test
-    fun pairerMatchesNearestTimestampsAndDropsOrphans() {
-        val p = FramePairer<Long>(10) { it }
-        assertNull(p.addRef(100))
-        assertEquals(100L to 103L, p.addAux(103))
-        assertNull(p.addRef(200)) // its partner never arrives
-        assertNull(p.addRef(300))
-        assertEquals(300L to 298L, p.addAux(298))
-        assertEquals(1, p.dropped)
+    fun syncGroupsFramesOfTwoCamerasAndDropsOrphans() {
+        val s = FrameSync<Long>(2, 10) { it }
+        assertNull(s.add(0, 100))
+        assertEquals(listOf(100L, 103L), s.add(1, 103))
+        assertNull(s.add(0, 200)) // its partner never arrives
+        assertNull(s.add(0, 300))
+        assertEquals(listOf(300L, 298L), s.add(1, 298))
+        assertEquals(1, s.dropped)
     }
 
     @Test
-    fun pairerPrefersTheCloserOfTwoCandidates() {
-        val p = FramePairer<Long>(10) { it }
-        assertNull(p.addRef(100))
-        assertNull(p.addRef(108))
-        assertEquals(108L to 109L, p.addAux(109))
+    fun syncWaitsForAllThreeCameras() {
+        val s = FrameSync<Long>(3, 10) { it }
+        assertNull(s.add(0, 100))
+        assertNull(s.add(2, 104))
+        assertNull(s.add(0, 133))
+        assertEquals(listOf(100L, 101L, 104L), s.add(1, 101))
+        assertNull(s.add(1, 134))
+        assertEquals(listOf(133L, 134L, 137L), s.add(2, 137))
+        assertEquals(0, s.dropped)
+    }
+
+    @Test
+    fun gyroIntegrationRecoversAConstantTurn() {
+        val gyro = GyroIntegrator()
+        for (i in 0..100) gyro.add(i * 5_000_000L, 0.0, 0.4, 0.0) // 200 Hz for half a second
+        val r = gyro.rotation(50_000_000, 450_000_000)!!
+        val want = StereoGeometry.rodrigues(doubleArrayOf(0.0, 0.4 * 0.4, 0.0))
+        for (i in 0..8) assertEquals(want[i], r[i], 1e-9)
+        assertEquals(0.4, gyro.peakRate(0, 500_000_000)!!, 1e-12)
+        assertNull(gyro.rotation(450_000_000, 900_000_000)) // not covered by samples
+    }
+
+    @Test
+    fun turningThePhoneLeftMovesTheSceneRightInTheUprightView() {
+        // portrait phone, back camera mounted at 90 degrees: upright "right" is image -y
+        val theta = 0.05
+        val turnLeft = StereoGeometry.rodrigues(doubleArrayOf(0.0, theta, 0.0)) // about the phone's up axis
+        val f = 480.0
+        val h = StereoGeometry.motionHomography(
+            turnLeft, StereoGeometry.orientationRotation(90, false), Mat3.identity, f, 320.0, 240.0,
+        )
+        val p = Mat3.mulVec(h, doubleArrayOf(320.0, 240.0, 1.0))
+        assertEquals(320.0, p[0] / p[2], 1e-9)
+        assertEquals(240.0 - f * kotlin.math.tan(theta), p[1] / p[2], 1e-9)
+    }
+
+    @Test
+    fun lineFitIsRobustAndRefusesAFlatScene() {
+        val rng = Random(1)
+        val n = 500
+        val x = FloatArray(n) { 2 + rng.nextFloat() * 28 }
+        val y = FloatArray(n) { if (it % 6 == 0) rng.nextFloat() * 60 else 1.8f * x[it] - 4 + rng.nextGaussian().toFloat() * 0.1f }
+        val line = StereoGeometry.fitLine(x, y)
+        assertNotNull(line)
+        assertEquals(1.8, line!!.slope, 0.02)
+        assertEquals(-4.0, line.offset, 0.3)
+        assertTrue(line.inliers > 380)
+        assertNull(StereoGeometry.fitLine(FloatArray(n) { 5f }, y))
     }
 }
