@@ -331,3 +331,68 @@ def integrate_gyro(times_ns, rates, t0_ns, t1_ns) -> np.ndarray:
         if end > start:
             r = r @ rodrigues(rates[i] * (end - start) * 1e-9)
     return r
+
+
+def row_shift_plane(profiles_left, profiles_right, width, max_shift=12, segments=3, min_score=0.4):
+    """Frame-by-frame misalignment between two rectified images, across the baseline.
+
+    While a phone moves, its cameras stop lining up by a few pixels: the sensors are not
+    exposed at exactly the same instant, their rolling shutters differ, and optical
+    stabilisation and autofocus shift one lens but not the other. Stereo matching needs
+    the rows to agree to about a pixel, so this is measured for every frame.
+
+    Inputs are row-mean profiles: for each of several vertical bands of the image (left
+    to right), the mean of every row. Averaging along the baseline makes a profile
+    insensitive to depth, so the shift between the two cameras' profiles is pure
+    misalignment. It is measured for a grid of blocks and a plane is fitted:
+
+        content at (x, y) in the left image sits at (x, y + a + b*x + c*y) in the right
+
+    Returns (a, b, c, number of blocks that gave a confident measurement).
+    """
+    bands = len(profiles_left)
+    xs, ys, shifts = [], [], []
+    for band in range(bands):
+        left = np.asarray(profiles_left[band], float)
+        right = np.asarray(profiles_right[band], float)
+        dl = left[2:] - left[:-2]  # derivative: ignores brightness differences
+        dr = right[2:] - right[:-2]
+        n = len(dl)
+        for seg in range(segments):
+            y0 = max(max_shift, seg * n // segments)
+            y1 = min(n - max_shift, (seg + 1) * n // segments)
+            if y1 - y0 < 16:
+                continue
+            a = dl[y0:y1]
+            energy = float(a @ a)
+            if energy / (y1 - y0) < 0.05:
+                continue  # no texture across the baseline in this block
+            scores = np.array([
+                float(a @ dr[y0 + s:y1 + s]) / np.sqrt(energy * float(dr[y0 + s:y1 + s] @ dr[y0 + s:y1 + s]) + 1e-9)
+                for s in range(-max_shift, max_shift + 1)
+            ])
+            k = int(np.argmax(scores))
+            if scores[k] < min_score or k == 0 or k == 2 * max_shift:
+                continue  # weak, or the true shift is outside the search range
+            denom = scores[k - 1] - 2 * scores[k] + scores[k + 1]
+            sub = 0.5 * (scores[k - 1] - scores[k + 1]) / denom if abs(denom) > 1e-9 else 0.0
+            xs.append((band + 0.5) * width / bands)
+            ys.append((y0 + y1) / 2 + 1)
+            shifts.append(k - max_shift + sub)
+    n = len(shifts)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 0
+    xs, ys, shifts = np.array(xs), np.array(ys), np.array(shifts)
+    constant = (float(np.median(shifts)), 0.0, 0.0, n)
+    if n < 5:
+        return constant
+    design = np.stack([np.ones(n), xs, ys], axis=1)
+    keep = np.ones(n, bool)
+    for _ in range(2):
+        sol, *_ = np.linalg.lstsq(design[keep], shifts[keep], rcond=None)
+        keep = np.abs(design @ sol - shifts) < 1.5
+        if keep.sum() < 5:
+            return constant
+    if abs(sol[1]) > 0.05 or abs(sol[2]) > 0.05:
+        return constant
+    return float(sol[0]), float(sol[1]), float(sol[2]), int(keep.sum())

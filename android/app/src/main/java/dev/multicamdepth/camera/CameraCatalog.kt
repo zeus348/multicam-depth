@@ -18,6 +18,8 @@ class CameraPair(
     val sensorOrientation: Int,
     val syncType: Int?,
     val timestampSource: Int?,
+    /** fastest fixed frame rate the camera offers (up to 30): keeps exposures short in dim light */
+    val fixedFps: Int?,
     val canDisableDistortionCorrection: Boolean,
     val hasDistortionCorrection: Boolean,
     val ref: PhysicalCamera,
@@ -63,6 +65,8 @@ object CameraCatalog {
                 sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
                 syncType = chars.get(CameraCharacteristics.LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE),
                 timestampSource = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
+                fixedFps = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    ?.filter { it.lower == it.upper && it.upper <= 30 }?.maxOfOrNull { it.upper },
                 canDisableDistortionCorrection =
                     modes?.contains(CameraMetadata.DISTORTION_CORRECTION_MODE_OFF) == true,
                 hasDistortionCorrection = modes != null && modes.any { it != CameraMetadata.DISTORTION_CORRECTION_MODE_OFF },

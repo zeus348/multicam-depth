@@ -9,6 +9,7 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -321,6 +322,94 @@ object StereoGeometry {
         val k = doubleArrayOf(f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0)
         val kInv = doubleArrayOf(1 / f, 0.0, -cx / f, 0.0, 1 / f, -cy / f, 0.0, 0.0, 1.0)
         return Mat3.mul(Mat3.mul(k, m), kInv)
+    }
+
+    /** Content at (x, y) in the left image sits at (x, y + a + b*x + c*y) in the right. */
+    class RowShift(val a: Double, val b: Double, val c: Double, val blocks: Int)
+
+    /**
+     * Frame-by-frame misalignment between two rectified images, across the baseline.
+     *
+     * While a phone moves, its cameras stop lining up by a few pixels: the sensors are not
+     * exposed at exactly the same instant, their rolling shutters differ, and optical
+     * stabilisation and autofocus shift one lens but not the other. Stereo matching needs
+     * rows to agree to about a pixel, so this is measured for every frame.
+     *
+     * Inputs are row-mean profiles: for each of several vertical bands of the image (left
+     * to right), the mean of every row. Averaging along the baseline makes a profile
+     * insensitive to depth, so the shift between the two cameras' profiles is pure
+     * misalignment. It is measured for a grid of blocks and a plane is fitted.
+     * Mirrors row_shift_plane in tools/mcdepth/geometry.py.
+     */
+    fun rowShiftPlane(
+        profilesLeft: Array<FloatArray>,
+        profilesRight: Array<FloatArray>,
+        width: Int,
+        maxShift: Int,
+        segments: Int = 3,
+        minScore: Double = 0.4,
+    ): RowShift {
+        val bands = profilesLeft.size
+        val xs = ArrayList<Double>()
+        val ys = ArrayList<Double>()
+        val shifts = ArrayList<Double>()
+        for (band in 0 until bands) {
+            val l = profilesLeft[band]
+            val r = profilesRight[band]
+            val n = l.size - 2
+            // derivative: ignores brightness differences between the cameras
+            val dl = DoubleArray(n) { (l[it + 2] - l[it]).toDouble() }
+            val dr = DoubleArray(n) { (r[it + 2] - r[it]).toDouble() }
+            for (seg in 0 until segments) {
+                val y0 = max(maxShift, seg * n / segments)
+                val y1 = min(n - maxShift, (seg + 1) * n / segments)
+                if (y1 - y0 < 16) continue
+                var energy = 0.0
+                for (y in y0 until y1) energy += dl[y] * dl[y]
+                if (energy / (y1 - y0) < 0.05) continue // no texture across the baseline here
+                val scores = DoubleArray(2 * maxShift + 1) { i ->
+                    val sft = i - maxShift
+                    var dot = 0.0
+                    var other = 0.0
+                    for (y in y0 until y1) {
+                        dot += dl[y] * dr[y + sft]
+                        other += dr[y + sft] * dr[y + sft]
+                    }
+                    dot / sqrt(energy * other + 1e-9)
+                }
+                val k = scores.indices.maxByOrNull { scores[it] }!!
+                // weak, or the true shift is outside the search range
+                if (scores[k] < minScore || k == 0 || k == 2 * maxShift) continue
+                val denom = scores[k - 1] - 2 * scores[k] + scores[k + 1]
+                val sub = if (abs(denom) > 1e-9) 0.5 * (scores[k - 1] - scores[k + 1]) / denom else 0.0
+                xs += (band + 0.5) * width / bands
+                ys += (y0 + y1) / 2.0 + 1
+                shifts += k - maxShift + sub
+            }
+        }
+        val n = shifts.size
+        if (n == 0) return RowShift(0.0, 0.0, 0.0, 0)
+        val constant = RowShift(shifts.sorted()[n / 2], 0.0, 0.0, n)
+        if (n < 5) return constant
+        var keep = BooleanArray(n) { true }
+        var sol = doubleArrayOf(0.0, 0.0, 0.0)
+        repeat(2) {
+            val ata = DoubleArray(9)
+            val atb = DoubleArray(3)
+            for (i in 0 until n) {
+                if (!keep[i]) continue
+                val row = doubleArrayOf(1.0, xs[i], ys[i])
+                for (p in 0..2) {
+                    atb[p] += row[p] * shifts[i]
+                    for (q in 0..2) ata[p * 3 + q] += row[p] * row[q]
+                }
+            }
+            sol = Mat3.solve(ata, atb) ?: return constant
+            keep = BooleanArray(n) { abs(sol[0] + sol[1] * xs[it] + sol[2] * ys[it] - shifts[it]) < 1.5 }
+            if (keep.count { it } < 5) return constant
+        }
+        if (abs(sol[1]) > 0.05 || abs(sol[2]) > 0.05) return constant
+        return RowShift(sol[0], sol[1], sol[2], keep.count { it })
     }
 
     class Line(val slope: Double, val offset: Double, val inliers: Int)

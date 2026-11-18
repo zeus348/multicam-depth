@@ -274,4 +274,39 @@ class GeometryTest {
         assertTrue(line.inliers > 380)
         assertNull(StereoGeometry.fitLine(FloatArray(n) { 5f }, y))
     }
+
+    @Test
+    fun rowShiftPlaneMeasuresAShiftThatVariesAcrossTheImage() {
+        // three bands of a random texture; the right image's rows sit at y + a + b*x + c*y
+        val rng = Random(4)
+        val h = 480
+        val w = 640
+        val a = 3.4
+        val b = 0.004
+        val c = 0.003
+        val textures = Array(3) { DoubleArray(h + 64) { rng.nextDouble() * 255 } }
+        fun sample(t: DoubleArray, y: Double): Float {
+            val p = (y + 32).coerceIn(0.0, t.size - 2.0)
+            val i = p.toInt()
+            return (t[i] * (1 - (p - i)) + t[i + 1] * (p - i)).toFloat()
+        }
+        // smooth so there is sub-pixel structure, as in a real image
+        for (t in textures) for (pass in 0 until 3) for (i in 1 until t.size - 1) t[i] = (t[i - 1] + 2 * t[i] + t[i + 1]) / 4
+        val left = Array(3) { band -> FloatArray(h) { sample(textures[band], it.toDouble()) } }
+        val right = Array(3) { band ->
+            val x = (band + 0.5) * w / 3
+            // right(y') = left(y) with y' = y + a + b x + c y  =>  y = (y' - a - b x) / (1 + c)
+            FloatArray(h) { sample(textures[band], (it - a - b * x) / (1 + c)) }
+        }
+        val shift = StereoGeometry.rowShiftPlane(left, right, w, 12)
+        assertTrue(shift.blocks >= 7)
+        assertEquals(a, shift.a, 0.3)
+        assertEquals(b, shift.b, 0.001)
+        assertEquals(c, shift.c, 0.001)
+        val none = StereoGeometry.rowShiftPlane(left, left, w, 12)
+        assertEquals(0.0, none.a, 0.05)
+        // a blank wall gives nothing to measure, and must say so
+        val blank = Array(3) { FloatArray(h) { 120f } }
+        assertEquals(0, StereoGeometry.rowShiftPlane(blank, blank, w, 12).blocks)
+    }
 }

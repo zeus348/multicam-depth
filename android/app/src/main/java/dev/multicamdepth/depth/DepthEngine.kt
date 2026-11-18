@@ -103,6 +103,12 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private var rangeHi = Double.NaN
     private var fuseSlope = Double.NaN // other pair's disparity = slope * ours + offset, eased
     private var fuseOffset = Double.NaN
+
+    /** this frame's measured row misalignment in pixels, and how many image blocks agreed on it */
+    var trackedShift = 0.0
+        private set
+    var trackedBlocks = 0
+        private set
     private var previous: Mat? = null // last disparity, for temporal smoothing
 
     init {
@@ -411,7 +417,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             return m
         }
         val left = canonical(rectRef)
-        val right = canonical(rectAux)
+        val right = trackRows(left, canonical(rectAux), temps)
         val validLeft = canonical(validRef)
         val validRight = canonical(validAux)
 
@@ -464,6 +470,31 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         return disp
     }
 
+    /**
+     * Shifts the second image so that its rows agree with the first for this frame; see
+     * StereoGeometry.rowShiftPlane for why they stop agreeing while the phone moves.
+     * Both images are in matcher form (baseline horizontal).
+     */
+    private fun trackRows(left: Mat, right: Mat, temps: MutableList<Mat>): Mat {
+        val w = left.cols()
+        val h = left.rows()
+        fun profiles(m: Mat) = Array(TRACK_BANDS) { b ->
+            val band = m.submat(0, h, b * w / TRACK_BANDS, (b + 1) * w / TRACK_BANDS)
+            val column = Mat()
+            Core.reduce(band, column, 1, Core.REDUCE_AVG, CvType.CV_32F)
+            FloatArray(h).also { column.get(0, 0, it) }.also { column.release(); band.release() }
+        }
+        val shift = StereoGeometry.rowShiftPlane(profiles(left), profiles(right), w, maxOf(4, h / 40))
+        trackedShift = shift.a
+        trackedBlocks = shift.blocks
+        if (shift.blocks == 0 || (abs(shift.a) < 0.15 && abs(shift.b) * w < 0.3 && abs(shift.c) * h < 0.3)) return right
+        val m = Mat(2, 3, CvType.CV_64F).apply { put(0, 0, 1.0, 0.0, 0.0, shift.b, 1.0 + shift.c, shift.a) }
+        val out = Mat().also { temps += it }
+        Imgproc.warpAffine(right, out, m, Size(w.toDouble(), h.toDouble()), Imgproc.INTER_LINEAR or Imgproc.WARP_INVERSE_MAP)
+        m.release()
+        return out
+    }
+
     /** 5x5 median over valid disparities: removes thin streaks and isolated wrong matches. */
     private fun despeckle(disp: Mat) {
         val clamped = Mat()
@@ -488,9 +519,11 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
      * related by a line; it is fitted where both are valid and then, per pixel: agreeing
      * values are averaged, clear conflicts dropped as false matches, and holes in one are
      * filled from the other. Same logic as fuse_disparities in tools/mcdepth/pipeline.py.
+     * [dropConflicts] should be false while the phone moves: the pairs then disagree because
+     * of motion, not because one is a false match.
      * Returns a summary for the status display.
      */
-    fun absorb(disp: Mat, otherDisp: Mat, other: DepthEngine): String {
+    fun absorb(disp: Mat, otherDisp: Mat, other: DepthEngine, dropConflicts: Boolean): String {
         // this view's pixel -> the other view's pixel: same camera centre, so a pure rotation
         val kInv = doubleArrayOf(1 / focal, 0.0, -cx / focal, 0.0, 1 / focal, -cy / focal, 0.0, 0.0, 1.0)
         val h = Mat3.mul(Mat3.mul(Mat3.mul(other.kNew, other.rect.r1), Mat3.transpose(rect.r1)), kInv)
@@ -548,7 +581,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
             Core.addWeighted(a32, 1 - w, conv, w, 0.0, avg)
             avg.copyTo(a32, agree)
             conv.copyTo(a32, onlyB)
-            a32.setTo(Scalar(-1.0), conflict)
+            if (dropConflicts) a32.setTo(Scalar(-1.0), conflict)
             a32.convertTo(disp, CvType.CV_16S, 16.0)
             return "third camera: %d px confirmed, %d filled, %d rejected".format(
                 Core.countNonZero(agree), Core.countNonZero(onlyB), Core.countNonZero(conflict),
@@ -683,6 +716,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
 
     private companion object {
         const val BLOCK = 5
+        const val TRACK_BANDS = 3
         const val RANGE_KEEP = 0.85 // weight of the previous colour range
         const val FUSE_KEEP = 0.8 // weight of the previous relation between the two pairs
         const val FUSE_AGREE = 1.5 // pixels of disparity within which two pairs confirm each other

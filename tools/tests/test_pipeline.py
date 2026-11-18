@@ -46,6 +46,7 @@ def test_refine_recovers_bad_extrinsics():
     bad = StereoRig(true_rig.ref, true_rig.aux, err @ true_rig.r, err @ true_rig.t)
 
     sd = StereoDepth(bad, out_size=(640, 480))
+    sd.track_rows = False  # per-frame tracking would hide the error this test is about
     _, _, _, before = sd.compute(ref, aux)
     info = sd.refine(ref, aux)
     assert info["applied"] and info["inliers"] > 50
@@ -190,3 +191,40 @@ def test_third_camera_fills_holes_and_removes_false_matches():
     # and it must not make the untouched part worse
     untouched = np.isfinite(disp_a) & np.isfinite(fused)
     assert np.nanmedian(np.abs(fused - disp_a)[untouched]) < 0.25
+
+
+@pytest.mark.parametrize("baseline", [(0.012, 0, 0), (0.001, 0.012, 0)], ids=["horizontal", "vertical"])
+def test_row_tracking_recovers_a_frame_knocked_out_of_alignment(baseline):
+    """What motion does on a real phone: for one frame the second camera's image is
+    shifted and slightly sheared across the baseline."""
+    import cv2
+
+    rig = synth.phone_rig(baseline=baseline)
+    ref, aux, truth = synth.render_pair(rig)
+    sd = StereoDepth(rig, out_size=(640, 480))
+    rect_ref, rect_aux = sd.rectify(ref, aux)
+    if sd.rect.vertical:  # across the baseline is x
+        m = np.array([[1.004, 0.006, 4.5], [0, 1, 0]])
+    else:  # across the baseline is y
+        m = np.array([[1, 0, 0], [0.006, 1.004, 4.5]])
+    knocked = cv2.warpAffine(rect_aux, m, (640, 480), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+
+    sd.track_rows = False
+    broken = sd.disparity(rect_ref, knocked)
+    sd.track_rows = True
+    tracked = sd.disparity(rect_ref, knocked)
+    clean = sd.disparity(rect_ref, rect_aux)
+    valid = lambda d: np.isfinite(d).mean()
+    assert valid(broken) < 0.5 * valid(clean)
+    assert valid(tracked) > 0.9 * valid(clean)
+    assert sd.last_tracking["blocks"] >= 5
+    both = np.isfinite(tracked) & np.isfinite(clean)
+    assert np.median(np.abs(tracked - clean)[both]) < 0.3
+
+
+def test_row_tracking_leaves_an_aligned_pair_alone():
+    rig = synth.phone_rig()
+    ref, aux, _ = synth.render_pair(rig)
+    sd = StereoDepth(rig, out_size=(640, 480))
+    sd.compute(ref, aux)
+    assert abs(sd.last_tracking["shift_px"]) < 0.2

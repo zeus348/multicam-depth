@@ -42,7 +42,7 @@ class MainActivity : Activity() {
         const val ALIGN_RETRY_FRAMES = 10
         const val STEADY_RAD_S = 0.3 // slower than this the phone counts as held still
         const val KEEP_STEADY = 0.6 // weight of the previous depth frame
-        const val KEEP_MOVING = 0.85 // while turning the new frame is blurrier, so trust it less
+        const val KEEP_MOVING = 0.3 // the gyroscope only knows rotation, so while moving lean on the new frame
     }
 
     private lateinit var cameraManager: CameraManager
@@ -296,7 +296,7 @@ class MainActivity : Activity() {
                 if (e2 != null && aux2 != null) {
                     fusion = if (e.aligned && e2.aligned) {
                         val other = e2.match(ref, aux2)
-                        e.absorb(disp, other, e2).also { other.release() }
+                        e.absorb(disp, other, e2, dropConflicts = steady).also { other.release() }
                     } else {
                         "third camera: $alignNote2"
                     }
@@ -318,6 +318,7 @@ class MainActivity : Activity() {
                     "left: ${mode.label} (tap image to switch)\n$alignNote\n" +
                     (if (fusion.isNotEmpty()) "$fusion\n" else "") +
                     (if (notice.isNotEmpty()) "$notice\n" else "") +
+                    "row tracking: %+.1f px (%d of 9 blocks)\n".format(e.trackedShift, e.trackedBlocks) +
                     "$motionNote$rec"
                 runOnUiThread {
                     refView.setImageBitmap(r.reference)

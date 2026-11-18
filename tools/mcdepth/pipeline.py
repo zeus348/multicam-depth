@@ -39,6 +39,9 @@ class StereoDepth:
         self.max_disparity = max_disparity
         # the app uses the faster 3-direction matcher; offline the fuller one streaks less
         self.sgbm_mode = cv2.STEREO_SGBM_MODE_SGBM
+        # re-measure the row misalignment for every frame; see geometry.row_shift_plane
+        self.track_rows = True
+        self.last_tracking = None
         self._reset()
 
     def _reset(self):
@@ -235,6 +238,9 @@ class StereoDepth:
         if flipped:
             mats = [cv2.flip(m, 1) for m in mats]
         left, right, valid_left, valid_right = mats
+        self.last_tracking = None
+        if self.track_rows:
+            right = self._track_rows(left, right)
         nd = self.num_disparities
         block = 5
         sgbm = cv2.StereoSGBM_create(
@@ -268,6 +274,21 @@ class StereoDepth:
             disp = cv2.transpose(disp)
         disp[disp <= 0] = np.nan
         return disp
+
+    def _track_rows(self, left, right, bands=3):
+        """Shift the right image so its rows agree with the left for this frame."""
+        h, w = left.shape
+
+        def profiles(img):
+            return [img[:, b * w // bands:(b + 1) * w // bands].mean(axis=1) for b in range(bands)]
+
+        max_shift = max(4, h // 40)
+        a, b, c, blocks = geometry.row_shift_plane(profiles(left), profiles(right), w, max_shift)
+        self.last_tracking = {"shift_px": a, "blocks": blocks}
+        if blocks == 0 or (abs(a) < 0.15 and abs(b) * w < 0.3 and abs(c) * h < 0.3):
+            return right
+        m = np.array([[1.0, 0.0, 0.0], [b, 1.0 + c, a]])
+        return cv2.warpAffine(right, m, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
 
     def depth_from_disparity(self, disp: np.ndarray) -> np.ndarray:
         """Depth along the optical axis, metres (if rig.metric)."""

@@ -104,6 +104,8 @@ class MultiCameraController(
                         created.forEach { addTarget(it.surface) }
                         // anything that moves the lens or warps the image breaks the calibration
                         set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                        // a fixed frame rate stops auto-exposure from stretching exposures (and motion blur) in dim light
+                        pair.fixedFps?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(it, it)) }
                         set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
                         if (disableDistortionCorrection && pair.canDisableDistortionCorrection) {
                             set(CaptureRequest.DISTORTION_CORRECTION_MODE, CameraMetadata.DISTORTION_CORRECTION_MODE_OFF)
