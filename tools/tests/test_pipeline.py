@@ -228,3 +228,14 @@ def test_row_tracking_leaves_an_aligned_pair_alone():
     sd = StereoDepth(rig, out_size=(640, 480))
     sd.compute(ref, aux)
     assert abs(sd.last_tracking["shift_px"]) < 0.2
+
+
+def test_thin_streaks_are_filled_but_real_holes_are_kept():
+    from mcdepth.pipeline import fill_streaks
+
+    disp = np.full((60, 80), 7.0, np.float32)
+    disp[20:22, 10:60] = -1  # a dash two rows tall
+    disp[35:50, 30:50] = -1  # a genuine hole
+    out = fill_streaks(disp)
+    assert (out[20:22, 10:60] == 7.0).all()
+    assert (out[38:47, 30:50] <= 0).all()

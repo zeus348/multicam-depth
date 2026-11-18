@@ -456,6 +456,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         Core.compare(validLeft, Scalar(0.0), outside, Core.CMP_EQ)
         Core.bitwise_or(bad, outside, bad)
         disp.setTo(Scalar(-16.0), bad)
+        fillStreaks(disp)
 
         if (flipped) Core.flip(disp, disp, 1)
         if (rect.vertical) {
@@ -493,6 +494,24 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
         Imgproc.warpAffine(right, out, m, Size(w.toDouble(), h.toDouble()), Imgproc.INTER_LINEAR or Imgproc.WARP_INVERSE_MAP)
         m.release()
         return out
+    }
+
+    /**
+     * Closes thin gaps that run along the baseline. The matcher leaves such dashes where its
+     * left-right check fails on a single row; a gap only a few rows tall with valid depth on
+     * both sides is filled from those neighbours. [disp] is in matcher form (baseline horizontal).
+     */
+    private fun fillStreaks(disp: Mat) {
+        val kernel = Mat.ones(STREAK_REACH, 1, CvType.CV_8UC1)
+        val closed = Mat()
+        val holes = Mat()
+        val filled = Mat()
+        Imgproc.morphologyEx(disp, closed, Imgproc.MORPH_CLOSE, kernel)
+        Core.compare(disp, Scalar(0.0), holes, Core.CMP_LE)
+        Core.compare(closed, Scalar(0.0), filled, Core.CMP_GT)
+        Core.bitwise_and(holes, filled, holes)
+        closed.copyTo(disp, holes)
+        listOf(kernel, closed, holes, filled).forEach { it.release() }
     }
 
     /** 5x5 median over valid disparities: removes thin streaks and isolated wrong matches. */
@@ -717,6 +736,7 @@ class DepthEngine(private val rig: StereoRig, private val outW: Int, private val
     private companion object {
         const val BLOCK = 5
         const val TRACK_BANDS = 3
+        const val STREAK_REACH = 5 // rows; taller gaps are treated as real holes
         const val RANGE_KEEP = 0.85 // weight of the previous colour range
         const val FUSE_KEEP = 0.8 // weight of the previous relation between the two pairs
         const val FUSE_AGREE = 1.5 // pixels of disparity within which two pairs confirm each other

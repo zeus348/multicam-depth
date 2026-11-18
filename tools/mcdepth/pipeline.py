@@ -267,7 +267,7 @@ class StereoDepth:
         xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
         landed = cv2.remap(valid_right, xs - np.maximum(disp, 0), ys, cv2.INTER_NEAREST)
         disp[(landed == 0) | (valid_left == 0)] = -1
-        disp = despeckle(disp)
+        disp = fill_streaks(despeckle(disp))
         if flipped:
             disp = cv2.flip(disp, 1)
         if self.rect.vertical:
@@ -306,6 +306,19 @@ def despeckle(disp: np.ndarray) -> np.ndarray:
     as_u16 = np.clip(disp * 16, 0, 65535).astype(np.uint16)
     out = cv2.medianBlur(as_u16, 5).astype(np.float32) / 16.0
     out[(out <= 0) | (disp <= 0)] = -1
+    return out
+
+
+def fill_streaks(disp: np.ndarray, reach: int = 5) -> np.ndarray:
+    """Close thin gaps that run along the baseline. The matcher leaves such dashes where
+    its left-right check fails on a single row; a gap only a few rows tall with valid
+    depth on both sides is filled from those neighbours. `disp` is in matcher form
+    (baseline horizontal), invalid = anything <= 0."""
+    kernel = np.ones((reach, 1), np.uint8)
+    closed = cv2.morphologyEx(disp, cv2.MORPH_CLOSE, kernel)
+    holes = (disp <= 0) & (closed > 0)
+    out = disp.copy()
+    out[holes] = closed[holes]
     return out
 
 
